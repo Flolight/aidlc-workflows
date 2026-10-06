@@ -6,7 +6,10 @@
 // the PLUGIN API (auto-discovered from .opencode/plugin/*.ts, loaded in-process
 // by the opencode runtime). This one plugin maps opencode's hook surface onto
 // the core hook bodies, each run as a bun subprocess fed the ClaudeCodeHookInput
-// JSON shape the core hooks parse (live-verified on opencode 1.17.18):
+// JSON shape the core hooks parse (live-verified on opencode 1.17.18). The
+// default export serves opencode 1 through server() and OpenCode 2 through
+// setup(); the OpenCode 2 section at the end of this file maps V2 moments onto
+// the V1 hooks below:
 //
 //   opencode moment                           -> core hook (Claude event it mirrors)
 //   ----------------------------------------------------------------------------
