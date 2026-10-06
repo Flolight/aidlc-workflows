@@ -544,13 +544,19 @@ function sessionStartHandled(stdout: string): boolean {
   }
 }
 
-export default async ({
+/**
+ * The OpenCode 1 plugin: returns the hook map keyed by V1 hook name. OpenCode 2
+ * does not run it; its `setup` entry (below) feeds V2 events into this same map.
+ * Not exported by name: OpenCode 1 loads every exported function of a plugin
+ * module as a plugin, so the module exports only its default object.
+ */
+async function createV1Adapter({
   client,
   directory,
   aidlcEntrypoints = shippedAidlcEntrypoints,
   aidlcCommand = DEFAULT_AIDLC_COMMAND,
   platform = process.platform,
-}: PluginInput) => {
+}: PluginInput) {
   const runCore = (
     hookFile: string,
     input: Record<string, unknown>,
@@ -772,7 +778,9 @@ export default async ({
     },
 
     "tool.execute.before": async (
-      input: { tool: string; sessionID: string; callID: string },
+      // `agent` is supplied by OpenCode 2, whose tool events name the calling
+      // agent; OpenCode 1 omits it and the chat.message correlation is used.
+      input: { tool: string; sessionID: string; callID: string; agent?: string },
       output: { args: Record<string, unknown> },
     ) => {
       const args = output.args ?? {};
@@ -811,7 +819,7 @@ export default async ({
           }
         }
       }
-      const namedAgent = sessionAgent.get(input.sessionID);
+      const namedAgent = input.agent ?? sessionAgent.get(input.sessionID);
       const delegatedAgent =
         namedAgent?.startsWith("aidlc-") && namedAgent.endsWith("-agent")
           ? namedAgent
@@ -1144,4 +1152,201 @@ export default async ({
       }
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// OpenCode 2 entry point.
+//
+// OpenCode 2 ignores V1 plugin functions: it reads `id` + `setup(ctx)` from the
+// default export and registers hooks on the context's domains. Rather than
+// fork the hook logic, setup() builds the V1 hook map above over a small
+// client shim and forwards each V2 hook or event to the V1 hook it replaces
+// (live-verified on opencode 2.0.24):
+//
+//   V2 moment                                  → V1 hook driven
+//   ------------------------------------------------------------------------
+//   session.hook("prompt")                     → chat.message
+//   tool.hook("execute.before")                → tool.execute.before
+//   tool.hook("execute.after")                 → tool.execute.after
+//   session.hook("compaction")                 → experimental.session.compacting
+//   event session.execution.succeeded          → event session.idle
+//   event session.execution.interrupted        → event session.error (aborted)
+//   event permission.replied                   → event permission.replied
+//
+// V2 renames built-in tools (shell, subagent, patch); toV1Tool maps them back
+// so the hook map keeps one vocabulary. The nudge is sent with
+// session.synthetic, which V2 never routes through the prompt hook, so it can
+// never be recorded as a human turn.
+//
+// Degradations vs the V1 path (documented in docs/guide/harnesses/opencode.md):
+//   - V2 has no todo tool, so aidlc-sync-workflow-state.ts (todowrite) never
+//     runs; workflow state is still advanced by the engine's own commands.
+//   - V2 has no command.execute.before: the person's chat shows the /aidlc
+//     template, and the human-turn hook reads the submitted prompt text.
+//   - There is no TUI toast channel; the conductor skill still prints the
+//     engine-error relay message verbatim.
+//   - The shell setting is not exposed, so the bash boundary reads commands
+//     in the platform's default shell dialect.
+// ---------------------------------------------------------------------------
+
+/** A V2 hook callback; each registration narrows `event` to the shape it reads. */
+export type V2HookCallback = (event: never) => Promise<void> | void;
+
+/** The subset of the OpenCode 2 plugin context this adapter uses. */
+export type V2PluginContext = {
+  location: { directory: string };
+  session: {
+    get(input: { sessionID: string }): Promise<{ parentID?: string } | undefined>;
+    synthetic(input: { sessionID: string; text: string }): Promise<unknown>;
+    hook(name: string, callback: V2HookCallback): Promise<unknown>;
+  };
+  tool: {
+    hook(name: string, callback: V2HookCallback): Promise<unknown>;
+  };
+  event: {
+    subscribe(options?: { signal?: AbortSignal }): AsyncIterable<{ type: string; data?: Record<string, unknown> }>;
+  };
+};
+
+/** Unit-test seams for the V2 entry point (production passes none). */
+export type V2SetupOptions = Pick<PluginInput, "aidlcEntrypoints" | "aidlcCommand" | "platform">;
+
+const V2_TOOL_NAMES: Record<string, string> = {
+  shell: "bash",
+  subagent: "task",
+  patch: "apply_patch",
+};
+
+function toV1Tool(tool: string): string {
+  return V2_TOOL_NAMES[tool] ?? tool;
+}
+
+/** The text a V2 tool result carries, as V1's string `output`. */
+function v2ToolOutput(result: unknown): string {
+  const r = result as { output?: { output?: unknown }; content?: Array<{ type?: string; text?: string }> };
+  if (typeof r?.output?.output === "string") return r.output.output;
+  return (r?.content ?? [])
+    .filter((c) => c.type === "text" && typeof c.text === "string")
+    .map((c) => c.text)
+    .join("\n");
+}
+
+type V1Hooks = Awaited<ReturnType<typeof createV1Adapter>>;
+
+/**
+ * Wire the V1 hook map onto an OpenCode 2 context. Returns the cleanup that
+ * stops the event subscription. Reached through the default export's setup().
+ */
+async function setupV2(
+  ctx: V2PluginContext,
+  options: V2SetupOptions = {},
+): Promise<() => void> {
+  // Parents learned from session.created, so a child is known even before a
+  // session lookup answers.
+  const parents = new Map<string, string | null>();
+  const client: PluginInput["client"] = {
+    session: {
+      get: async ({ path }) => {
+        const known = parents.get(path.id);
+        if (known !== undefined) return { data: known ? { parentID: known } : {} };
+        const info = await ctx.session.get({ sessionID: path.id });
+        if (!info) return {};
+        return { data: info.parentID ? { parentID: info.parentID } : {} };
+      },
+      prompt: async ({ path, body }) => {
+        const text = body.parts.map((p) => p.text).join("\n");
+        return ctx.session.synthetic({ sessionID: path.id, text });
+      },
+    },
+  };
+  const hooks: V1Hooks = await createV1Adapter({
+    client,
+    directory: ctx.location.directory,
+    ...options,
+  });
+
+  await ctx.session.hook("prompt", async (event: {
+    sessionID: string;
+    prompt: { text?: string };
+  }) => {
+    await hooks["chat.message"](
+      { sessionID: event.sessionID },
+      { parts: [{ type: "text", text: event.prompt?.text ?? "" }] },
+    );
+  });
+
+  await ctx.tool.hook("execute.before", async (event: {
+    tool: string;
+    sessionID: string;
+    id: string;
+    agent?: string;
+    input: Record<string, unknown>;
+  }) => {
+    const output = { args: event.input ?? {} };
+    await hooks["tool.execute.before"](
+      { tool: toV1Tool(event.tool), sessionID: event.sessionID, callID: event.id, agent: event.agent },
+      output,
+    );
+    if (output.args !== event.input) event.input = output.args;
+  });
+
+  await ctx.tool.hook("execute.after", async (event: {
+    tool: string;
+    sessionID: string;
+    id: string;
+    input: Record<string, unknown>;
+    status: "completed" | "error";
+    result?: unknown;
+  }) => {
+    const tool = toV1Tool(event.tool);
+    // A failed write changed nothing to audit; a failed subagent still ended.
+    if (event.status !== "completed" && tool !== "task") return;
+    await hooks["tool.execute.after"](
+      { tool, sessionID: event.sessionID, callID: event.id, args: event.input ?? {} },
+      { output: v2ToolOutput(event.result) },
+    );
+  });
+
+  await ctx.session.hook("compaction", async (event: { sessionID: string }) => {
+    await hooks["experimental.session.compacting"]({ sessionID: event.sessionID });
+  });
+
+  const controller = new AbortController();
+  void (async () => {
+    try {
+      for await (const ev of ctx.event.subscribe({ signal: controller.signal })) {
+        const data = ev.data ?? {};
+        const sessionID = typeof data.sessionID === "string" ? data.sessionID : "";
+        if (!sessionID) continue;
+        if (ev.type === "session.created") {
+          parents.set(sessionID, typeof data.parentID === "string" ? data.parentID : null);
+        } else if (ev.type === "session.execution.succeeded") {
+          await hooks.event({ event: { type: "session.idle", properties: { sessionID } } });
+        } else if (ev.type === "session.execution.interrupted") {
+          await hooks.event({
+            event: { type: "session.error", properties: { sessionID, error: { name: "MessageAbortedError" } } },
+          });
+        } else if (ev.type === "permission.replied") {
+          await hooks.event({ event: { type: "permission.replied", properties: { sessionID, reply: data.reply } } });
+        }
+      }
+    } catch {
+      /* the stream ends when the plugin unloads */
+    }
+  })();
+  return () => controller.abort();
+}
+
+// One default export serves both hosts: OpenCode 1 (1.18.29+) calls server(),
+// OpenCode 2 calls setup(). OpenCode 1.18 also calls setup() with a partial
+// context that has no tool or session domain; setup() returns early there so
+// the V1 hooks never run twice.
+export default {
+  id: "aidlc",
+  // `options` is a unit-test seam; OpenCode passes only the context.
+  async setup(ctx: V2PluginContext, options?: V2SetupOptions): Promise<(() => void) | undefined> {
+    if (typeof ctx?.tool?.hook !== "function" || typeof ctx?.session?.hook !== "function") return undefined;
+    return setupV2(ctx, options);
+  },
+  server: createV1Adapter,
 };
