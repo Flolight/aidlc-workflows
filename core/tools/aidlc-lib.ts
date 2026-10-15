@@ -43647,7 +43647,6 @@ export type BoltDagResolution =
       batches: string[][];
       units: string[];
       unitKinds: Map<string, string> | null;
-      healed: boolean;
     }
   | { state: "none" }
   | { state: "malformed"; reason: string; detail: string };
@@ -43722,7 +43721,6 @@ export function resolveBoltDag(
             batches: typedBatches,
             units,
             unitKinds: unitKinds.size > 0 ? unitKinds : null,
-            healed: false,
           };
         }
       }
@@ -43754,7 +43752,6 @@ export function resolveBoltDag(
     batches: parsed.batches,
     units: parsed.batches.flat(),
     unitKinds: unitKinds.size > 0 ? unitKinds : null,
-    healed: true,
   };
   return cached !== null && boltDagMatches(cached, authored) ? cached : authored;
 }
