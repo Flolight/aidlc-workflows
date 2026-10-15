@@ -1464,12 +1464,21 @@ the remedies that are executable from the current lifecycle
 state (`in-progress`, `awaiting-approval`, `revising`, `completed`, `pending`,
 `skipped`; for a team Unit, the Unit's own gate status). Every remedy carries a
 closed `op` from `GUARD_REMEDY_OPS` in `aidlc-lib.ts` (`present-approval-gate`,
-`request-review`, `start-recovery-review`, `apply-repairs-then-request`,
+`present-findings-at-gate`, `request-review`, `start-recovery-review`, `apply-repairs-then-request`,
 `record-verdict`, `retry-pending`, `request-changes`, `finish-revision`, `redo-jump`,
 `restore-or-jump`, `restart-stage`, `redo-unit-step`, `reopen-unit-step`,
-`review-advisory-gate`, `change-scope`, `restore-scope`, `abort-bolt`, `record-unit-completion`, `repair-source-boundary`, `reconfirm-summary`,
+`review-advisory-gate`, `change-scope`, `restore-scope`, `abort-bolt`, `record-unit-completion`,
+`dispatch-pipeline-links`, `repair-source-boundary`, `reconfirm-summary`,
 `unset-unattended`, `lower-fence`). Routing decisions compare `op` and never the
-remedy sentence; the directive contract refuses an unknown `op`. `lower-fence`
+remedy sentence; the directive contract refuses an unknown `op`. Two refusals
+are the conductor's own step: a missing pipeline handoff
+(`PIPELINE_EVIDENCE_MISSING`) offers `dispatch-pipeline-links`, whose action is
+the refusal's own sentence naming the links (at an open gate they are recorded
+first, then `next` shows the gate again; when the refused step was the person's
+approval, the same approval runs again, so they are not asked twice), and a
+review pass the cap refuses with nobody having asked for it
+(`REVIEW_BUDGET_EXHAUSTED`) offers `present-findings-at-gate` before
+`present-approval-gate`, the same gate with its findings. `lower-fence`
 is the one remedy a refusal adds LAST, and only when the refusal is a fence
 holding. It is a `command` choice: its `operation` is
 `{kind: "lower-fence", fence}` and its `command` is the setter, so the way past
