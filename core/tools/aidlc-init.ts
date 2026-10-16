@@ -13110,10 +13110,26 @@ export async function main(
       const broken = [...new Set(conflicts.filter((item) => !forceable(item.detail)).map((item) => item.path))];
       const one = cited.length === 1;
       const listed = (paths: string[]): string => paths.length === 1 ? paths[0] : paths.join(", ");
+      // No section takes --force; config itself does, from the source this run
+      // used, and the section's own change lands when it runs once more. A
+      // mirror URL can carry its credential, so the line asks for it back
+      // instead of printing it.
+      const sourceArgs = argv.flatMap((arg, index) =>
+        arg === "--download"
+          ? [arg]
+          : ["--from", "--harness", "--ca-bundle"].includes(arg)
+          ? [arg, argv[index + 1]]
+          : []
+      );
+      const force = section
+        ? `run \`${
+          configRerunWith(["config", ...sourceArgs], projectDir, ["--force"]) ?? configCommand("--force")
+        }\`${argv.includes("--release-base-url") ? " with the same --release-base-url" : ""}, then the same command again`
+        : "run it again with --force";
       const forward = broken.length === 0
         ? `to keep your version, move ${one ? cited[0] : "those files"} somewhere else and run ` +
           `the same command again; to take the shipped ${one ? "version" : "versions"} over ` +
-          `${one ? "it" : "them"}, run it again with --force. ` +
+          `${one ? "it" : "them"}, ${force}. ` +
           `\`${configCommand("--dry-run --verbose")}\` lists every change first.`
         : broken.length < cited.length
         ? `move ${listed(cited)} somewhere else (or fix ${listed(broken)} in place instead of moving ` +
