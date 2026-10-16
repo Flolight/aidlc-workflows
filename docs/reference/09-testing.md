@@ -1747,7 +1747,10 @@ The declared coverage is:
   and requires doctor to name the trust fix. Codex's golden journey
   (`tests/e2e/t-exec-codex-journey-golden-bugfix.serial.test.ts`, Linux and
   Windows) fixes the same greeter from the first line to Code Generation approved,
-  with the plan question left for the day and approved in a new session.
+  with the plan question left for the day and approved in a new session; Copilot's
+  (`tests/e2e/t-exec-copilot-journey-golden-bugfix.serial.test.ts`, Linux only:
+  on Windows it runs past the 25 minutes a retry allows) does the same on the
+  copy-channel install of its release journey.
 - Kiro ACP, TUI and IDE are declared exclusions pending a dedicated isolated
   Windows desktop host; local live runs remain their coverage path.
 - Cursor is excluded: no credential separation is available because its vendor
