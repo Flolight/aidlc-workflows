@@ -38316,6 +38316,24 @@ export function isKiroConductorAgentFile(name: string): boolean {
   return KIRO_CONDUCTOR_AGENT_FILES.includes(basename(name));
 }
 
+// A reviewer copy one review request writes on Kiro (kiro-ide) when the
+// reviewer read-scope preview feature is on (aidlc-kiro-review-copy.ts): the
+// installed reviewer with that review's read scope added, named from the
+// request id so the name stands for that one request. It is the reviewer under
+// another name, never a persona of its own.
+const SCOPED_REVIEW_COPY_RE = /^aidlc-scoped-review-[0-9a-f]{12}$/;
+
+/** The reviewer copy's agent name for a review request id, or null for an id not minted as `review:<hex>`. */
+export function scopedReviewCopyName(requestId: string): string | null {
+  const m = /^review:([0-9a-f]{12})[0-9a-f]{20}$/.exec(requestId);
+  return m ? `aidlc-scoped-review-${m[1]}` : null;
+}
+
+/** Whether an agent name, or an agent file name, is a reviewer copy's. */
+export function isScopedReviewCopy(name: string): boolean {
+  return SCOPED_REVIEW_COPY_RE.test(basename(name).replace(/\.md$/, ""));
+}
+
 export function isAidlcAgentFile(path: string): boolean {
   return aidlcAgentClaim(path) !== null;
 }
@@ -38335,7 +38353,7 @@ export function loadAgents(): AgentMetadata[] {
     const slugToFile = new Map<string, string>();
     const agents: AgentMetadata[] = [];
     const files = readdirSync(dir)
-      .filter((f) => f.endsWith(".md") && !isKiroConductorAgentFile(f))
+      .filter((f) => f.endsWith(".md") && !isKiroConductorAgentFile(f) && !isScopedReviewCopy(f))
       .sort();
     for (const f of files) {
       const filePath = join(dir, f);
