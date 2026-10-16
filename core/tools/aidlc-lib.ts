@@ -3756,11 +3756,7 @@ export function codekbScopeFingerprint(
   excludedPaths: string[] = [],
 ): string | null {
   if (paths.length === 0) return null;
-  const normalizePath = (path: string): string => {
-    let normalized = path.replaceAll("\\", "/");
-    normalized = normalized.replace(/^(?:\.\/)+/, "").replace(/\/+$/, "");
-    return normalized === "." ? "" : normalized;
-  };
+  const normalizePath = (path: string): string => normalizeScopePath(path.replaceAll("\\", "/"));
   const normalizedExclusions = excludedPaths.map(normalizePath);
   const survivingPaths = paths
     .map((original) => ({ original, normalized: normalizePath(original) }))
@@ -4199,14 +4195,29 @@ export function codekbStoreIsCurrent(
   return current !== null && current === parsed.scope.fingerprint;
 }
 
-// Coverage test for the compare mode: does the incoming run's analyzed set
-// cover a store entry? Literal match, or an incoming DIRECTORY prefix (entry
-// ending "/") subsuming the store path. Deliberately prefix-only - scope
-// paths are authored as repo-relative dirs/files, not globs.
+// One spelling of a scope path for comparing: a leading "./" and a trailing "/" go, and
+// the repo root ("." or "./") becomes "". `a`, `a/` and `./a/` name the same entry. A
+// backslash is left alone: the source fingerprint turns a backslash into / before it calls
+// this; nothing else does.
+export function normalizeScopePath(path: string): string {
+  const normalized = path.replace(/^(?:\.\/)+/, "").replace(/\/+$/, "");
+  return normalized === "." ? "" : normalized;
+}
+
+// Coverage test for publish and the compare mode: does the incoming run's
+// analyzed set cover a store entry? The same path in either spelling (a trailing
+// slash or a leading "./" does not change what it names), or an incoming
+// DIRECTORY (entry ending "/") subsuming the store path. A path written without
+// the slash covers only itself. Whether a path exists, or is a file or a
+// directory, is the source fingerprint's to say, not this test's. Deliberately
+// prefix-only - scope paths are authored as repo-relative dirs/files, not globs -
+// and a prefix ends at a "/", so `a/` never covers `a.txt`.
 export function scopePathCovered(incoming: string[], storePath: string): boolean {
-  return incoming.some(
-    (p) => p === storePath || (p.endsWith("/") && storePath.startsWith(p)),
-  );
+  const store = normalizeScopePath(storePath);
+  return incoming.some((p) => {
+    const covering = normalizeScopePath(p);
+    return covering === store || (covering !== "" && p.endsWith("/") && store.startsWith(`${covering}/`));
+  });
 }
 
 // The bare SPACE record root: `aidlc/spaces/<space>/intents/`. The absolute path
