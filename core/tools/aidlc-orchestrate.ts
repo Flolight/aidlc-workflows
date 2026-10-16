@@ -1246,10 +1246,14 @@ function speaksToPerson(directive: Directive): boolean {
 // what else it can ask for, once, with the first step it speaks from. The line
 // rides the engine's own narration: left to the protocol, it went unsaid.
 let pickingUp = false;
+// The stage a step with none of its own picks up at (an open question shown
+// again on a bare re-entry).
+let pickUpStage: string | null = null;
 const PICK_UP_LEAD = "Picking up where we left off, at ";
 function pickUpLine(directive: Directive): string | null {
   const step = directive as { stage?: unknown; unit?: unknown };
-  const node = typeof step.stage === "string" ? nodeForSlug(step.stage) : undefined;
+  const slug = typeof step.stage === "string" ? step.stage : pickUpStage;
+  const node = slug !== null ? nodeForSlug(slug) : undefined;
   if (!node) return null;
   const unit = typeof step.unit === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(step.unit) ? ` for ${step.unit}` : "";
   return `${PICK_UP_LEAD}${stageLabel(node, node.slug) ?? node.slug}${unit}. ` +
@@ -2180,6 +2184,12 @@ const KEPT_REPLIES_NOTE =
   "each answer they gave on its [Answer]: line and record it with `log answer`, then ask only what is still open. " +
   "Never ask them again what they already answered.";
 
+// Whether a questions file in `dir` still has a blank answer.
+function hasBlankAnswer(dir: string): boolean {
+  return existsSync(dir) && readdirSync(dir).some((name) =>
+    name.endsWith("-questions.md") && /\[Answer\]:[ \t]*_*[ \t]*$/m.test(readFileSync(join(dir, name), "utf-8")));
+}
+
 function withKeptReplies(directive: Directive): Directive {
   if (isRouteCheckProbe() || directive.kind !== "run-stage" || directive.gate_only || directive.build_settled) {
     return directive;
@@ -2190,9 +2200,7 @@ function withKeptReplies(directive: Directive): Directive {
     const dir = directive.phase === "construction" && directive.unit
       ? join(docsRoot(projectDir), "construction", directive.unit, directive.stage)
       : stageDir(projectDir, directive.phase, directive.stage);
-    const blank = existsSync(dir) && readdirSync(dir).some((name) =>
-      name.endsWith("-questions.md") && /\[Answer\]:[ \t]*_*[ \t]*$/m.test(readFileSync(join(dir, name), "utf-8")));
-    if (!blank) return directive;
+    if (!hasBlankAnswer(dir)) return directive;
     const kept = keptRepliesSinceStageStart(projectDir, {
       stage: directive.stage,
       ...(directive.phase === "construction" && directive.unit ? { unit: directive.unit } : {}),
@@ -3486,16 +3494,10 @@ function openGateReplyDirective(stage: string, requestId: string, folder: string
   );
 }
 
-// Prose while the current stage has a question the person has not answered
-// yet (the audit pairing the Stop hook reads) may be its answer, or something
-// else. Reading which is the conductor's job, so it gets a command for each:
-// the question's own answer command, or `next --request` with the person's
-// words, kept as `requestId`, which asks where that work belongs. The
-// question's text stays in the audit, never in this directive.
-// A checkpoint's commands name its Unit or batch from the question's own row,
-// so a new chat, which never saw the question asked, has all it needs.
-function openQuestionReplyDirective(stage: string, block: string, requestId: string): PrintDirective {
-  const orchestrate = aidlcToolInvocation("orchestrate");
+// How the person's answer to the stage's open question is recorded, named
+// from the question's own row, so a new chat, which never saw it asked, has
+// all it needs.
+function openQuestionAnswer(stage: string, block: string): string {
   const checkpoint = auditBlockField(block, "Checkpoint");
   const unit = auditBlockField(block, "Unit");
   const batch = auditBlockField(block, "Batch number");
@@ -3520,7 +3522,7 @@ function openQuestionReplyDirective(stage: string, block: string, requestId: str
       ? [` --checkpoint construction-policy --field ${shellArg(field)} --value ${shellArg(value)}`,
         `set-${field.toLowerCase().replaceAll(" ", "-")} ${shellArg(value)}`]
       : [null, null];
-  const answer = gate
+  return gate
     ? `answer it through that checkpoint, never \`log answer\` (which would not approve it): run \`${gate} --action ` +
       `approve${target}\` or \`${gate} --action reject${target}\`${target ? "" : " for that Unit or batch"}, passing ` +
       "the person's reply unchanged as `--user-input` (and their feedback as `--reason` when they ask for changes)"
@@ -3531,6 +3533,17 @@ function openQuestionReplyDirective(stage: string, block: string, requestId: str
         "say its notice line"
       : `record it with \`${aidlcToolInvocation("log")} answer --stage ${shellArg(stage)} --details '<their exact reply>'\` ` +
         "(with the checkpoint flags that question was logged with, when it has them)";
+}
+
+// Prose while the current stage has a question the person has not answered
+// yet (the audit pairing the Stop hook reads) may be its answer, or something
+// else. Reading which is the conductor's job, so it gets a command for each:
+// the question's own answer command, or `next --request` with the person's
+// words, kept as `requestId`, which asks where that work belongs. The
+// question's text stays in the audit, never in this directive.
+function openQuestionReplyDirective(stage: string, block: string, requestId: string): PrintDirective {
+  const orchestrate = aidlcToolInvocation("orchestrate");
+  const answer = openQuestionAnswer(stage, block);
   return printDirective(
     `Stage "${stage}" has a question you asked that the person has not answered yet. Read their reply. ` +
       `If it answers that question, ${answer}, then carry on with "${stage}" from where you asked and run bare ` +
@@ -3539,6 +3552,42 @@ function openQuestionReplyDirective(stage: string, block: string, requestId: str
       `or a change to the plan, run \`${orchestrate} next --request ${requestId}\` and follow what it returns: the ` +
       "engine kept their words and asks them where that work belongs. If you cannot tell which it is, ask the " +
       "person in one short question and follow their answer.",
+  );
+}
+
+// A bare re-entry (`/aidlc` alone, or `--resume`) while the current stage has
+// a question the agent asked in chat that no step of its own asks again (one
+// logged with no checkpoint, or a Construction policy question a record
+// carries): the agent shows it again from its row and waits, so the person
+// keeps their place. The text goes out verbatim: a question box pairs the
+// reply with a protected question by that text or its two choices. Null for
+// any other question; its own step asks it again with what it asks about. So
+// is a question the stage's questions file still holds (a guided batch logs
+// only its question numbers): the stage's step asks it from the file, with any
+// reply kept for it (withKeptReplies). Unreadable is left to that step too.
+function openQuestionAgainDirective(projectDir: string, stage: string, block: string): PrintDirective | null {
+  const checkpoint = auditBlockField(block, "Checkpoint");
+  if (checkpoint !== null && checkpoint !== CONSTRUCTION_POLICY_CHECKPOINT) return null;
+  try {
+    const phase = nodeForSlug(stage)?.phase ?? "";
+    const construction = join(docsRoot(projectDir), "construction");
+    const unitDirs = phase === "construction" && existsSync(construction)
+      ? readdirSync(construction).map((unit) => join(construction, unit, stage))
+      : [];
+    if ([stageDir(projectDir, phase, stage), ...unitDirs].some(hasBlankAnswer)) return null;
+  } catch {
+    return null;
+  }
+  const decision = auditBlockField(block, "Decision");
+  if (!decision) return null;
+  const choices = (auditBlockField(block, "Options") ?? "").split(",").map((option) => option.trim()).filter(Boolean);
+  return printDirective(
+    `Stage "${stage}" has a question you asked that the person has not answered yet. Show it to them again, word ` +
+      `for word as it was asked, with its choices, and end your turn: ${JSON.stringify(decision)}` +
+      `${choices.length > 0 ? `, with the choices ${choices.map((choice) => JSON.stringify(choice)).join(", ")}` : ""}. ` +
+      `When they answer it, ${openQuestionAnswer(stage, block)}, then carry on with "${stage}" from where you asked ` +
+      `and run bare \`${aidlcToolInvocation("orchestrate")} next\` the next time you need the engine. If they say ` +
+      "something else, pass their words to `next` and follow what it returns.",
   );
 }
 
@@ -10235,6 +10284,22 @@ function routeNext(agentArgs: string[], projectDir: string | undefined): void {
         undefined, routingSettings(carriedRoutingFlags(flags)),
       );
       emit(reentryReplyDirective(words.id, undo, workNamesHere(pd, selection), activeWorkLabel(stateContent)));
+      return;
+    }
+  }
+  // A bare re-entry while a question with no step of its own is open: it is
+  // shown again, and the turn ends at it (openQuestionAgainDirective).
+  if (
+    flags.resume && !flags.intent && !flags.stage && !flags.phase && !flags.single && question === undefined &&
+    !isTeamUnitOwnership(stateContent)
+  ) {
+    const open = openStageQuestion(pd, stateContent);
+    const again = open === null ? null : openQuestionAgainDirective(pd, open.stage, open.block);
+    if (open !== null && again !== null) {
+      pickUpStage = open.stage;
+      leadsToSpeech.add(again);
+      turnEndingPrints.add(again);
+      emit(again);
       return;
     }
   }
