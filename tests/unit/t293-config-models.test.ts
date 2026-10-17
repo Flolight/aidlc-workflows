@@ -56,7 +56,7 @@ const OWN_PICKER_LINES = {
   cursor:
     "Cursor runs every agent on the model you choose in its model picker, so a model or effort set here is kept for other tools and changes nothing in Cursor.",
   "kiro-ide":
-    "Kiro IDE runs every agent on the model you choose in its model picker, so a model or effort set here is kept for other tools and changes nothing in Kiro IDE.",
+    "AI-DLC does not write a model or effort into its Kiro agent files, so every agent runs on your chat's model and effort (Kiro IDE's model picker, or Kiro CLI's session model); a model or effort set here is kept for other tools and changes nothing in Kiro.",
   kiro:
     "Kiro CLI runs every agent on your session's model and effort, so an effort set here without a model is kept for other tools and changes nothing in Kiro CLI; a preset (minimal, balanced or thorough) sets the session's effort.",
 } as const;
@@ -741,7 +741,7 @@ describe("t293 config models CLI", () => {
     expect(result.status).toBe(2);
     expect(result.stdout).toContain("unknown config section");
     expect(result.stdout).toContain(
-      "valid sections: models, runtime, providers, trust, flags, project",
+      "valid sections: models, runtime, providers, trust, flags, project, preview",
     );
     expect(existsSync(join(project, ".claude"))).toBe(false);
   });
@@ -1634,6 +1634,26 @@ describe("t293 doctor model policy advisory", () => {
     expect(check.fix).toContain("architect: model policy is not expressible on cursor");
     expect(check.fix).not.toContain("effort policy");
   });
+
+  test("config models --check on kiro-ide leaves a shared effort to the session, as doctor does", () => {
+    const check = (models: unknown) => {
+      const project = temp("aidlc-t293-check-kiro-ide-");
+      cpSync(join(DIST, "kiro-ide"), project, { recursive: true });
+      writeFileSync(projectSettingsPath(project), `${JSON.stringify({ schemaVersion: 1, models }, null, 2)}\n`);
+      return run(["config", "models", "--project-dir", project, "--check"], project, runtimeEnv());
+    };
+    const shared = check({ schemaVersion: 1, preset: "balanced", groups: { reviewing: { effort: "max" } } });
+    expect(shared.status, shared.stdout).toBe(0);
+    expect(shared.stdout).toContain("model policy is reflected on kiro-ide");
+    // A model recorded for Kiro by name is still drift there; its effort is not.
+    const named = check({
+      schemaVersion: 1,
+      agents: { architect: { model: { "kiro-ide": "claude-sonnet-5.5" }, effort: "high" } },
+    });
+    expect(named.status).toBe(1);
+    expect(named.stdout).toContain("architect: model policy is not expressible on kiro-ide");
+    expect(named.stdout).not.toContain("architect: effort");
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
 
   test("doctor names the session where it sets every agent, and Kiro CLI carries the preset", () => {
     // A preset recorded for the team (setup records none on these hosts) is

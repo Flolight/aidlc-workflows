@@ -17,7 +17,7 @@
 
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { previewFeatureOn } from "./aidlc-channel.ts";
+import type { PreviewFeature } from "./aidlc-channel.ts";
 import {
   decideFence,
   installedKiroLayout,
@@ -28,11 +28,12 @@ import {
   swarmWorkerWorktreeMeta,
   writeFileAtomic,
 } from "./aidlc-lib.ts";
+import { treePreviewFeature } from "./aidlc-model-policy.ts";
 import { resolveHarnessPath } from "./aidlc-runtime-paths.ts";
 import { AIDLC_VERSION } from "./aidlc-version.ts";
 
 /** The preview feature this module implements. */
-export const REVIEWER_READ_SCOPE_FEATURE = "reviewer-read-scope";
+export const REVIEWER_READ_SCOPE_FEATURE: PreviewFeature = "reviewer-read-scope";
 
 // Where the reviewer can reach the Units' folders: every intent's record, and
 // a parallel batch's worktrees under .aidlc/worktrees/ (the reviewer's own
@@ -136,7 +137,10 @@ export function prepareReviewCopy(
   review: { requestId: string; reviewer: string; unit?: string },
   version: string = AIDLC_VERSION,
 ): ReviewCopyOutcome | null {
-  if (!review.unit || !previewFeatureOn(REVIEWER_READ_SCOPE_FEATURE, version)) return null;
+  // The project's Kiro tree is always `.kiro`, the folder the layout check
+  // reads too; read through a link as it is, so a copy that cannot be written
+  // there is still said.
+  if (!review.unit || !treePreviewFeature(join(projectDir, ".kiro"), REVIEWER_READ_SCOPE_FEATURE, version).on) return null;
   // Doctor lists a drop by its reason up to the first ": ", cut short, so the
   // reason starts with a short cause and the details follow it.
   const drop = (cause: string, detail: string) =>

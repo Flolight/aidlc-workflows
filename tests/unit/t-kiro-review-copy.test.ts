@@ -1,4 +1,4 @@
-// covers: file:tools/aidlc-kiro-review-copy.ts, function:previewFeatureOn, function:renderReviewCopy, function:prepareReviewCopy, function:scopedReviewCopyName, function:isScopedReviewCopy
+// covers: file:tools/aidlc-kiro-review-copy.ts, function:previewFeatureOn, function:readPreviewFeatures, function:renderReviewCopy, function:prepareReviewCopy, function:scopedReviewCopyName, function:isScopedReviewCopy
 //
 // On Kiro (kiro-ide) a delegated reviewer's own `fs_read` deny with an
 // `exclude` is enforced, and the agent file is read again at each dispatch
@@ -12,7 +12,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { PREVIEW_FEATURES_ENV, previewFeatureOn } from "../../core/tools/aidlc-channel.ts";
+import { PREVIEW_FEATURES_RECORD, previewFeatureOn, readPreviewFeatures } from "../../core/tools/aidlc-channel.ts";
 import {
   prepareReviewCopy,
   REVIEWER_READ_SCOPE_FEATURE,
@@ -36,24 +36,59 @@ const RECORD = "aidlc/spaces/default/intents/261015-notes";
 
 const saved = { ...process.env };
 afterEach(() => {
-  for (const key of [PREVIEW_FEATURES_ENV, "AIDLC_AGENTS_DIR", "AIDLC_HARNESS_NAME", "AIDLC_DISABLE_REVIEWER_SCOPE_HOOK"]) {
+  for (const key of ["AIDLC_PREVIEW_FEATURES", "AIDLC_AGENTS_DIR", "AIDLC_HARNESS_DIR", "AIDLC_HARNESS_NAME", "AIDLC_DISABLE_REVIEWER_SCOPE_HOOK"]) {
     if (saved[key] === undefined) delete process.env[key];
     else process.env[key] = saved[key];
   }
   _resetAgentsForTests();
 });
 
+// The project's Kiro tree records the choice, as `aidlc config preview` writes
+// it; with no stamp the tree is on the engine's release.
+function recordPreview(dir: string, value: unknown, distribution = "kiro-ide"): void {
+  mkdirSync(join(dir, ".kiro", "tools", "data"), { recursive: true });
+  writeFileSync(
+    join(dir, ".kiro", "tools", "data", "harness.json"),
+    `${JSON.stringify({ schemaVersion: 1, harnessDir: ".kiro", distribution, [PREVIEW_FEATURES_RECORD]: value })}\n`,
+  );
+}
+
+function stampTree(dir: string, frameworkVersion: string): void {
+  writeFileSync(
+    join(dir, ".kiro", "tools", "data", "aidlc-stamp.json"),
+    `${JSON.stringify({ schemaVersion: 1, harnessDir: ".kiro", distribution: "kiro-ide", frameworkVersion })}\n`,
+  );
+}
+
 describe("the preview switch", () => {
-  test("a feature is on only in a preview build, and only when it is named", () => {
-    process.env[PREVIEW_FEATURES_ENV] = REVIEWER_READ_SCOPE_FEATURE;
-    expect(previewFeatureOn(REVIEWER_READ_SCOPE_FEATURE, PREVIEW)).toBe(true);
-    expect(previewFeatureOn(REVIEWER_READ_SCOPE_FEATURE, STABLE)).toBe(false);
-    process.env[PREVIEW_FEATURES_ENV] = " other , reviewer-read-scope ";
-    expect(previewFeatureOn(REVIEWER_READ_SCOPE_FEATURE, PREVIEW)).toBe(true);
-    process.env[PREVIEW_FEATURES_ENV] = "reviewer-read";
-    expect(previewFeatureOn(REVIEWER_READ_SCOPE_FEATURE, PREVIEW)).toBe(false);
-    delete process.env[PREVIEW_FEATURES_ENV];
-    expect(previewFeatureOn(REVIEWER_READ_SCOPE_FEATURE, PREVIEW)).toBe(false);
+  test("a feature is on only on a preview release, and only where the tree records it on", () => {
+    expect(previewFeatureOn(REVIEWER_READ_SCOPE_FEATURE, { [REVIEWER_READ_SCOPE_FEATURE]: "on" }, PREVIEW)).toBe(true);
+    expect(previewFeatureOn(REVIEWER_READ_SCOPE_FEATURE, { [REVIEWER_READ_SCOPE_FEATURE]: "on" }, STABLE)).toBe(false);
+    expect(previewFeatureOn(REVIEWER_READ_SCOPE_FEATURE, { [REVIEWER_READ_SCOPE_FEATURE]: "off" }, PREVIEW)).toBe(false);
+    expect(previewFeatureOn(REVIEWER_READ_SCOPE_FEATURE, { "agent-models": "on" }, PREVIEW)).toBe(false);
+    expect(previewFeatureOn(REVIEWER_READ_SCOPE_FEATURE, {}, PREVIEW)).toBe(false);
+  });
+
+  test("the record is read as on or off per known feature, nothing else, and the variable plays no part", () => {
+    const dir = mkdtempSync(join(tmpdir(), "t-kiro-review-copy-"));
+    try {
+      const root = join(dir, ".kiro");
+      expect(readPreviewFeatures(root)).toEqual({});
+      recordPreview(dir, { "reviewer-read-scope": "on", "agent-models": "yes", "later-feature": "on" });
+      expect(readPreviewFeatures(root)).toEqual({ "reviewer-read-scope": "on" });
+      for (const value of ["on", ["reviewer-read-scope"], null]) {
+        recordPreview(dir, value);
+        expect(readPreviewFeatures(root), JSON.stringify(value)).toEqual({});
+      }
+      writeFileSync(join(root, "tools", "data", "harness.json"), "{");
+      expect(readPreviewFeatures(root)).toEqual({});
+      process.env.AIDLC_PREVIEW_FEATURES = REVIEWER_READ_SCOPE_FEATURE;
+      process.env.AIDLC_HARNESS_NAME = "kiro-ide";
+      mkdirSync(join(dir, ".kiro", "agents"), { recursive: true });
+      expect(prepareReviewCopy(dir, { requestId: REQUEST, reviewer: REVIEWER, unit: "alpha" }, PREVIEW)).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -144,14 +179,14 @@ describe("the copy's text", () => {
 });
 
 describe("when there is no copy", () => {
-  test("anything but a preview build with the feature on, on Kiro, for a Unit, dispatches the reviewer itself", () => {
+  test("anything but a preview release with the feature on, on Kiro, for a Unit, dispatches the reviewer itself", () => {
     const dir = mkdtempSync(join(tmpdir(), "t-kiro-review-copy-"));
     try {
       mkdirSync(join(dir, ".kiro", "agents"), { recursive: true });
       const review = { requestId: REQUEST, reviewer: REVIEWER, unit: "alpha" };
       process.env.AIDLC_HARNESS_NAME = "kiro-ide";
-      process.env[PREVIEW_FEATURES_ENV] = REVIEWER_READ_SCOPE_FEATURE;
-      expect(prepareReviewCopy(dir, review, STABLE), "stable build").toBeNull();
+      recordPreview(dir, { [REVIEWER_READ_SCOPE_FEATURE]: "on" });
+      expect(prepareReviewCopy(dir, review, STABLE), "stable release").toBeNull();
       expect(prepareReviewCopy(dir, { ...review, unit: undefined }, PREVIEW), "not a Unit's review").toBeNull();
       // A request id that names no copy is a copy the feature asked for and could not write: said, not silent.
       expect(prepareReviewCopy(dir, { ...review, requestId: "legacy" }, PREVIEW), "an id not minted here")
@@ -161,9 +196,23 @@ describe("when there is no copy", () => {
       delete process.env.AIDLC_DISABLE_REVIEWER_SCOPE_HOOK;
       process.env.AIDLC_HARNESS_NAME = "claude";
       expect(prepareReviewCopy(dir, review, PREVIEW), "another harness").toBeNull();
-      delete process.env[PREVIEW_FEATURES_ENV];
+      recordPreview(dir, { [REVIEWER_READ_SCOPE_FEATURE]: "off" });
       process.env.AIDLC_HARNESS_NAME = "kiro-ide";
-      expect(prepareReviewCopy(dir, review, PREVIEW), "feature not named").toBeNull();
+      expect(prepareReviewCopy(dir, review, PREVIEW), "feature off").toBeNull();
+      // The tree's stamped release decides, whatever the engine's, and a stamp
+      // that cannot be read records nothing.
+      recordPreview(dir, { [REVIEWER_READ_SCOPE_FEATURE]: "on" });
+      stampTree(dir, STABLE);
+      expect(prepareReviewCopy(dir, { ...review, requestId: "legacy" }, PREVIEW), "stable tree, preview engine").toBeNull();
+      stampTree(dir, PREVIEW);
+      expect(prepareReviewCopy(dir, { ...review, requestId: "legacy" }, STABLE), "preview tree, stable engine")
+        .toEqual({ notice: expect.stringContaining("This review of alpha can read other Units' files") });
+      stampTree(dir, "not-a-version");
+      expect(prepareReviewCopy(dir, { ...review, requestId: "legacy" }, PREVIEW), "unreadable stamp").toBeNull();
+      // A Kiro tree the feature is not for (the Kiro CLI v2 row), whose record config preview would not change.
+      rmSync(join(dir, ".kiro", "tools", "data", "aidlc-stamp.json"));
+      recordPreview(dir, { [REVIEWER_READ_SCOPE_FEATURE]: "on" }, "kiro");
+      expect(prepareReviewCopy(dir, { ...review, requestId: "legacy" }, PREVIEW), "kiro row").toBeNull();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

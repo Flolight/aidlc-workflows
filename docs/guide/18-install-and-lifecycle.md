@@ -510,6 +510,7 @@ aidlc config models --agent architect --effort xhigh --model provider/raw-id --p
 aidlc config models --check
 aidlc config models --reset --project --yes
 aidlc config models --session-model claude-opus-4.8   # Kiro CLI: your personal session model
+aidlc config preview agent-models on --yes            # Kiro, preview release: write one agent's own model and effort
 ```
 
 A change ends with what changed, its undo command and who picks it up (plus
@@ -517,7 +518,9 @@ any setup step still outstanding); `--json` and `--quiet` output are unchanged.
 
 `--show --json` prints every agent's effective model, effort, and provenance.
 `--check` is the CI inverse and exits non-zero when the recorded policy is not
-fully reflected in the harness surfaces.
+fully reflected in the harness surfaces. On Kiro IDE, where a preset changes
+nothing, a recorded effort it cannot write is left to the session, as in
+`aidlc doctor`, and does not fail the check.
 
 Model and flag policy resolves leaf-by-leaf through this hierarchy:
 
@@ -594,7 +597,10 @@ carries its effort through the project's `chat.modelDefaults`, which then
 replaces your personal effort map in that project. An effort set on Kiro CLI
 without a model is kept for other tools, and the command says so in one line.
 Kiro IDE, Cursor, and GitHub Copilot cannot portably pin
-agent models or effort, so setup records no preset there. A model or effort you
+agent models or effort, so setup records no preset there (on Kiro, a project on a
+preview release pins one agent's model and effort after
+`aidlc config preview agent-models on`:
+[Preview: one agent on its own model and effort](harnesses/kiro-ide.md#preview-one-agent-on-its-own-model-and-effort)). A model or effort you
 set anyway is kept for teammates on tools that apply it, writes no inert keys,
 and the command says in one line that this tool uses the model you choose in its
 own model picker. On those three, every agent uses the session's model and
@@ -612,7 +618,11 @@ Claude Opus 4.8. Where you set the model and effort depends on the harness:
 
 - **GitHub Copilot, Cursor, and Kiro IDE:** in the host, for the whole session.
   Every agent uses the model and effort of the chat you run `/aidlc` in, and
-  nothing AI-DLC records changes that. On Kiro IDE, a `model:` line you add
+  nothing AI-DLC records changes that, except on Kiro in a project on a preview
+  release that turned `aidlc config preview agent-models on`, where
+  `aidlc config models --agent` sets one agent's own model and effort
+  ([Preview: one agent on its own model and effort](harnesses/kiro-ide.md#preview-one-agent-on-its-own-model-and-effort)).
+  On Kiro IDE, a `model:` line you add
   to an agent's `.md` file by hand changes that agent until the next refresh
   (see [Customization](13-customization.md)); on Copilot such a pin is not
   portable, because the CLI and VS Code read model names differently.
@@ -660,7 +670,8 @@ readiness check and keeping each run small.
 `/aidlc --config [section]` is the conversational alias for these same config
 sections. The conductor reads the current JSON state before asking, gathers
 only the changes you want, and lands each accepted section through one exact
-`aidlc config <section> <explicit value flags> --yes` command. Leaving a
+`aidlc config <section> <explicit value flags> --yes` command (for preview,
+`aidlc config preview <feature> <on|off> --yes`). Leaving a
 section unchanged runs no command. After landing or declining, the alias stops;
 it never advances or resumes workflow work.
 
@@ -969,6 +980,30 @@ asks at a terminal, and scripts add `--download`.
 `--from <path>` instead uses files you downloaded: `aidlc-copy-runtime-X.Y.Z.tar.gz`,
 its extracted `runtime/` folder, or one harness root. Servers you added to
 `.mcp.json` yourself are never recorded or removed.
+
+### Preview Features
+
+A preview release can carry a feature that is not in the stable releases yet.
+It stays off until the project turns it on, and it applies only while the
+project is on a preview release:
+
+```bash
+aidlc config preview                                # each feature: on or off, and what it does
+aidlc config preview agent-models on --yes          # Kiro: one agent on its own model and effort
+aidlc config preview reviewer-read-scope on --yes   # Kiro: a Unit's reviewer reads only that Unit
+aidlc config preview agent-models off --yes
+```
+
+The choice is recorded in the project's harness folder
+(`.kiro/tools/data/harness.json`, `previewFeatures`), so later `aidlc config`
+runs, chats and reviews all read it, and `--local`, `--project` and `--global`
+do not apply. Turning one on needs a preview release
+([Release Channels](#release-channels)); turning one off works on any release,
+so a project moved back to stable can still clear it, and then says the steps
+to a preview release that turn it on again. `--download` goes with a
+change, as in the other sections. Both features are Kiro's
+today: [Kiro IDE](harnesses/kiro-ide.md#preview-a-units-reviewer-reads-only-that-unit)
+describes each.
 
 Plugin names are discovered from the installed graph, scopes, and plugin
 sidecars. They are not hardcoded. The selection continues to use the existing
@@ -1714,7 +1749,7 @@ yes, and the file is kept beside it as `aidlc.bak-<time>`.
 `aidlc --help` prints exactly the six public commands. Each public command also
 has side-effect-free command help: `aidlc <command> --help` (or `-h`) for
 `config`, `doctor`, `version`, `update`, `use`, and `uninstall`. Config-level
-help names all six policy sections; `aidlc config <section> --help` keeps the
+help names all seven policy sections; `aidlc config <section> --help` keeps the
 section-specific help. `aidlc help --all` reveals the hidden `engine` and
 `system` namespaces and points to
 `aidlc engine --help` / `aidlc system --help` for their full inventories.

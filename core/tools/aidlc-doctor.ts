@@ -51,11 +51,12 @@ import {
 } from "./aidlc-color.ts";
 import {
   HARNESS_PRODUCT_NAMES,
+  installedModelBuild,
   isModelHarness,
   modelPolicyDoctorIssues,
   modelPolicyIsEmpty,
+  presetsChangeNothing,
   sessionModelsDetail,
-  sessionSetsAgentModels,
   type ModelHarness,
 } from "./aidlc-model-policy.ts";
 import {
@@ -278,6 +279,7 @@ export function modelsPolicyCheck(projectDir: string, verbose: boolean): DoctorC
           harness.root,
           harness.distribution,
           modelPolicyForHarness(resolved.models, harness.distribution),
+          installedModelBuild(harness.root, harness.frameworkVersion),
         )
           .map((issue) => `${harness.distribution}: ${issue}`),
       );
@@ -304,7 +306,7 @@ export function modelsPolicyCheck(projectDir: string, verbose: boolean): DoctorC
   const installed = harnesses
     .map((harness) => harness.distribution)
     .filter((distribution): distribution is ModelHarness => isModelHarness(distribution));
-  const sessionSet = installed.filter((distribution) => sessionSetsAgentModels(distribution));
+  const sessionSet = installed.filter((distribution) => presetsChangeNothing(distribution));
   if (sessionSet.length > 0) {
     const others = installed.filter((distribution) => !sessionSet.includes(distribution));
     const policyFor = (distribution: ModelHarness) =>
@@ -315,9 +317,14 @@ export function modelsPolicyCheck(projectDir: string, verbose: boolean): DoctorC
     const parts = [
       ...(configured.length > 0 ? [`recorded policy is expressible on ${named(configured)}`] : []),
       ...(unconfigured.length > 0 ? [`no recorded policy for ${named(unconfigured)}`] : []),
-      ...sessionSet.map((distribution) =>
-        sessionModelsDetail(distribution, others.length === 0 ? policyFor(distribution) : null)
-      ),
+      ...sessionSet.map((distribution) => {
+        const tree = harnesses.find((harness) => harness.distribution === distribution);
+        return sessionModelsDetail(
+          distribution,
+          others.length === 0 ? policyFor(distribution) : null,
+          tree ? installedModelBuild(tree.root, tree.frameworkVersion) : {},
+        );
+      }),
     ];
     return { pass: true, label: `Models: ${parts.join("; ")}` };
   }

@@ -111,7 +111,21 @@ import {
   ReleaseVerificationError,
 } from "./aidlc-release.ts";
 import { AIDLC_VERSION } from "./aidlc-version.ts";
-import { compareVersions, RELEASE_CHANNELS, VERSION_ID } from "./aidlc-channel.ts";
+import {
+  compareVersions,
+  isPreviewFeature,
+  PREVIEW_CHANNEL,
+  PREVIEW_FEATURE_HARNESSES,
+  PREVIEW_FEATURES,
+  PREVIEW_FEATURES_RECORD,
+  type PreviewChoice,
+  type PreviewFeature,
+  previewFeatureOn,
+  previewFeaturesFrom,
+  RELEASE_CHANNELS,
+  VERSION_ID,
+  versionChannel,
+} from "./aidlc-channel.ts";
 import {
   type TransactionOperation,
   type TransactionOptions,
@@ -247,25 +261,33 @@ import {
 import {
   activeModelGroups,
   applyModelPolicyToProjection,
-  HARNESS_HONESTY,
   HARNESS_PRODUCT_NAMES,
   harnessHonestyNotes,
   isModelEffort,
+  installedModelBuild,
+  isModelId,
   isModelPreset,
+  KIRO_AGENT_MODELS_FEATURE,
+  KIRO_AGENT_MODELS_OFF_NOTE,
+  kiroAgentModelsOn,
   MODEL_EFFORTS,
   MODEL_GROUPS,
   MODEL_PRESETS,
+  modelHarnessHonesty,
   modelPolicyAgentsDir,
   modelPolicyIsEmpty,
   modelPolicySurfaceDrift,
   normalizeModelPolicy,
+  presetsChangeNothing,
   profileGroups,
   readAgentTiers,
   resolveModelPolicy,
   sessionModelsDetail,
-  sessionSetsAgentModels,
+  treePreviewFeature,
   type AgentTiers,
+  type KiroAgentModelsChoice,
   type ModelAgentPolicy,
+  type ModelBuild,
   type ModelEffort,
   type ModelGroup,
   type ModelHarness,
@@ -425,7 +447,13 @@ type ModelsMutationContext = {
   tiers: AgentTiers;
   summaryLines: string[];
   notes: string[];
-  settings: SettingsMutation;
+  // Absent when the recorded policy is unchanged: a preview feature's switch,
+  // or a repair of the agent files kiro-ide's agent-models applies.
+  settings?: SettingsMutation;
+  // `config preview <feature> on|off`: the choice this run records.
+  preview?: PreviewRequest;
+  // And its switch line and notes, said for the release the run sets up.
+  previewLines?: (version: string) => { summaryLines: string[]; notes: string[] };
 };
 
 type DiagnosticSection = "runtime" | "providers" | "trust";
@@ -1054,13 +1082,14 @@ export function validatePublicConfigArgs(input: readonly string[]): string | nul
   const section = positionals[0];
   if (!section) return validateRootConfigArgs(argv);
   if (!VALID_CONFIG_SECTIONS.has(section.value)) {
-    return `unknown config section ${JSON.stringify(section.value)}; valid sections: models, runtime, providers, trust, flags, project`;
+    return `unknown config section ${JSON.stringify(section.value)}; valid sections: ${CONFIG_SECTIONS.join(", ")}`;
   }
   const sectionArgv = [
     ...argv.slice(0, section.index),
     ...argv.slice(section.index + 1),
   ];
   if (section.value === "models") return validateModelsArgs(sectionArgv);
+  if (section.value === "preview") return validatePreviewArgs(sectionArgv);
   if (
     section.value === "runtime" ||
     section.value === "providers" ||
@@ -1141,12 +1170,15 @@ function modelStateData(
     }
   >;
   notes: string[];
+  // kiro-ide's agent-models preview feature: what is recorded, and whether it applies.
+  agentModels?: { recorded: KiroAgentModelsChoice | null; on: boolean };
 } {
   const cap = resolveTierCap(join(projectDir, "aidlc", "spaces", "default", "memory"));
+  const build = projectModelBuild(projectDir, harness);
   const effective = Object.entries(tiers).sort(([left], [right]) =>
     left.localeCompare(right)
   ).map(([name, tier]) => {
-    const item = resolveModelPolicy(policy, name, tier, harness, cap);
+    const item = resolveModelPolicy(policy, name, tier, harness, cap, build);
     const agent = resolved.models?.agents?.[name];
     const group = resolved.models?.groups?.[item.group];
     const presetGroups = resolved.models?.preset
@@ -1174,10 +1206,11 @@ function modelStateData(
     policy,
     effective,
     notes: [
-      ...harnessHonestyNotes(policy, tiers, harness, cap),
+      ...harnessHonestyNotes(policy, tiers, harness, cap, build, (args) => modelsCommand(projectDir, harness, args), (args) => previewCommand(projectDir, harness, args)),
       // On Kiro CLI the session model agents inherit is the saved one.
       ...(harness === "kiro" ? [KIRO_SAVED_MODEL_NOTE] : []),
     ],
+    ...(harness === "kiro-ide" ? { agentModels: { recorded: build.agentModels ?? null, on: kiroAgentModelsOn(build) } } : {}),
   };
 }
 
@@ -1192,6 +1225,19 @@ function namedHarness(projectDir: string, harness: string | undefined): string {
 // from where the user is.
 function modelsCommand(projectDir: string, harness: ModelHarness, args: string): string {
   return `${configInvocationFor(projectDir)} config models ${args}${namedHarness(projectDir, harness)}${projectTarget(projectDir)}`;
+}
+
+// The same for `config preview`.
+function previewCommand(projectDir: string, harness: string, args: string): string {
+  return `${configInvocationFor(projectDir)} config preview ${args}${namedHarness(projectDir, harness)}${projectTarget(projectDir)}`;
+}
+
+// The release and agent-models choice of this project's harness, for the
+// model-policy readers; kiro-ide is the only row they change.
+function projectModelBuild(projectDir: string, harness: ModelHarness): ModelBuild {
+  if (harness !== "kiro-ide") return {};
+  const installed = discoverProjectHarnesses(projectDir).find((item) => item.distribution === harness);
+  return installed ? installedModelBuild(installed.root, installed.frameworkVersion) : {};
 }
 
 function showModels(
@@ -1249,6 +1295,18 @@ function showModels(
     }
   }
   for (const note of data.notes) output += `  Note: ${note}\n`;
+  // Named on a preview release, and wherever a recorded on is left over.
+  const agentModels = data.agentModels;
+  if (
+    agentModels &&
+    (agentModels.recorded === "on" || versionChannel(projectModelBuild(projectDir, harness).version ?? AIDLC_VERSION) === PREVIEW_CHANNEL)
+  ) {
+    output += `\nAgent models (preview): ${agentModels.on ? "on" : "off"}${
+      agentModels.recorded === "on" && !agentModels.on
+        ? `; recorded on, which applies only on a preview release - ${previewCommand(projectDir, harness, "agent-models off --yes")} clears it`
+        : ` - ${previewCommand(projectDir, harness, `agent-models ${agentModels.on ? "off" : "on"} --yes`)} turns it ${agentModels.on ? "off" : "on"}`
+    }\n`;
+  }
   const recorded = ([
     ["global", resolved.files.machine],
     ["project", resolved.files.project],
@@ -1264,8 +1322,8 @@ function showModels(
   output += `\nRecorded in: ${
     displayedRecorded.length > 0
       ? displayedRecorded.join(", ")
-      : sessionSetsAgentModels(harness)
-      ? `nothing; ${sessionModelsDetail(harness, null)}`
+      : presetsChangeNothing(harness)
+      ? `nothing; ${sessionModelsDetail(harness, null, projectModelBuild(projectDir, harness))}`
       : `nothing yet - run '${modelsCommand(projectDir, harness, "--preset balanced --project --yes")}'`
   }\n`;
   writeMenuText(output);
@@ -1387,6 +1445,11 @@ function applyModelsFlags(
   if (effort && effort !== "default" && !isModelEffort(effort)) {
     throw new Error(`--effort must be one of ${MODEL_EFFORTS.join(", ")}, or default to remove the agent's own effort`);
   }
+  if (model && !isModelId(model)) {
+    throw new Error(
+      `--model takes one model id as your tool names it: letters, digits and punctuation with no spaces, starting with a letter or digit; got ${JSON.stringify(model)}`,
+    );
+  }
   // A model alone leaves the agent's effort where it was, and an effort alone
   // its model. `default` removes that one setting of the agent's, so the
   // preset or group applies to it again: the per-key way back from a change.
@@ -1431,6 +1494,7 @@ function modelSummaryLines(
   tiers: AgentTiers,
   harness: ModelHarness,
   projectDir: string,
+  build: ModelBuild = projectModelBuild(projectDir, harness),
 ): { lines: string[]; notes: string[] } {
   const cap = resolveTierCap(join(projectDir, "aidlc", "spaces", "default", "memory"));
   const lines: string[] = [];
@@ -1445,12 +1509,12 @@ function modelSummaryLines(
     const name = names[0];
     if (!name) continue;
     const tier = tiers[name];
-    const before = resolveModelPolicy(previous, name, tier, harness, cap);
-    const after = resolveModelPolicy(next, name, tier, harness, cap);
+    const before = resolveModelPolicy(previous, name, tier, harness, cap, build);
+    const after = resolveModelPolicy(next, name, tier, harness, cap, build);
     if (after.unexpressed.includes("effort")) {
       lines.push(
         `  ${MODEL_GROUPS[group].label.padEnd(11)} ${names.length} agents   ` +
-          `${afterDial ?? "inherit"} requested; ${harnessHonestyNotes(next, tiers, harness, cap)[0]}`,
+          `${afterDial ?? "inherit"} requested; ${harnessHonestyNotes(next, tiers, harness, cap, build, (args) => modelsCommand(projectDir, harness, args), (args) => previewCommand(projectDir, harness, args))[0]}`,
       );
       continue;
     }
@@ -1464,7 +1528,7 @@ function modelSummaryLines(
     );
     if (afterDial) lines.push(`  ${effortTradeoff(group, afterDial)}`);
   }
-  const notes = harnessHonestyNotes(next, tiers, harness, cap);
+  const notes = harnessHonestyNotes(next, tiers, harness, cap, build, (args) => modelsCommand(projectDir, harness, args), (args) => previewCommand(projectDir, harness, args));
   return { lines, notes };
 }
 
@@ -1520,9 +1584,10 @@ function modelsWizard(
       : targetCurrent;
   }
   if (choice === "3") {
+    const build = projectModelBuild(projectDir, harness);
     let next = targetCurrent;
     for (const name of Object.keys(tiers).sort()) {
-      const currentValue = resolveModelPolicy(current, name, tiers[name], harness);
+      const currentValue = resolveModelPolicy(current, name, tiers[name], harness, null, build);
       writeMenuText(
         `${name}: current ${currentValue.model ?? "inherit"}/${currentValue.effort ?? "inherit"}.\n`,
       );
@@ -2700,7 +2765,7 @@ function configRerunWith(
 }
 
 function configMutationRerun(
-  section: "models" | "runtime" | "providers" | "trust" | "flags" | "project",
+  section: "models" | "runtime" | "providers" | "trust" | "flags" | "project" | "preview",
   argv: readonly string[],
 ): string {
   const args = argv.filter((arg) => arg !== "--yes").map(commandToken);
@@ -2771,14 +2836,14 @@ function setupMapRows(
   const providerManaged = !harnessOwnsModelAccess(modelHarness(distribution));
   // Where the session sets every agent, there is no policy to ask for: the
   // row names the host's session as the lever and is never walked.
-  const sessionSet = sessionSetsAgentModels(modelHarness(distribution));
+  const sessionSet = presetsChangeNothing(modelHarness(distribution));
   const sessionAccess = records.providers === null &&
     providerAnswerIsTheSession(modelHarness(distribution));
   const providerNeeds = providerManaged && !sessionAccess &&
     (providers.length > 0 || records.providers === null);
   const modelsUnrecorded = !sessionSet && (!policy || modelPolicyIsEmpty(policy));
   const modelDetail = sessionSet
-    ? sessionModelsDetail(modelHarness(distribution), policy)
+    ? sessionModelsDetail(modelHarness(distribution), policy, projectModelBuild(projectDir, modelHarness(distribution)))
     : !policy || modelPolicyIsEmpty(policy)
     ? "no recorded policy; agents inherit your session model and effort"
     : policy.preset
@@ -2982,7 +3047,7 @@ function setupLedgerActions(
 ): ConfigOutstandingAction[] {
   const next = [...actions];
   if (
-    !sessionSetsAgentModels(harness) &&
+    !presetsChangeNothing(harness) &&
     !next.some((action) => action.section === "models")
   ) {
     const resolved = resolveAidlcSettings(projectDir);
@@ -6539,6 +6604,8 @@ function prepareRefreshSource(
   projectProjection: boolean,
   diagnosticsOverride?: ConfigDiagnosticOverrides,
   force = false,
+  // The caller passes the version of the release being staged.
+  previewRequest: { version: string; request?: PreviewRequest } = { version: AIDLC_VERSION },
 ): PreparedRefreshSource {
   // A copied project is not a release: never baseline the user's edits as
   // shipped entries during an in-place record mutation.
@@ -6680,6 +6747,35 @@ function prepareRefreshSource(
     if (diagnosticsOverride.plugins === null) delete staged.plugins;
     else staged.plugins = diagnosticsOverride.plugins;
   }
+  // The tree's preview-feature choices (`config preview`): what this run asks,
+  // else what is recorded; an entry this engine does not know is kept.
+  // agent-models' lines come out only in the run that turns off a choice that
+  // applied on the installed tree (a preview release, recorded on): the model
+  // and effort keys AI-DLC owns while it is on, out of every agent file it
+  // ships, the rest of each file as it is. A stable tree holds none of them:
+  // the move to it replaced those files, or stopped on an edited one.
+  const request = previewRequest.request;
+  const recordedPreview = staged[PREVIEW_FEATURES_RECORD];
+  const recordedChoices = typeof recordedPreview === "object" && recordedPreview !== null && !Array.isArray(recordedPreview)
+    ? recordedPreview as Record<string, unknown>
+    : {};
+  let previewRecorded = false;
+  if (request && recordedChoices[request.feature] !== request.choice) {
+    staged[PREVIEW_FEATURES_RECORD] = { ...recordedChoices, [request.feature]: request.choice };
+    previewRecorded = true;
+  }
+  let agentModelsChoice: KiroAgentModelsChoice | null = null;
+  let agentModelsTakeOut = false;
+  if (descriptor.distribution === "kiro-ide") {
+    agentModelsChoice = previewFeaturesFrom(staged[PREVIEW_FEATURES_RECORD])[KIRO_AGENT_MODELS_FEATURE] ?? null;
+    if (
+      request?.feature === KIRO_AGENT_MODELS_FEATURE && request.choice === "off" &&
+      treePreviewFeature(currentHarness, KIRO_AGENT_MODELS_FEATURE).on
+    ) {
+      agentModelsTakeOut = true;
+    }
+  }
+  const agentModelsBuild: ModelBuild = { version: previewRequest.version, agentModels: agentModelsChoice };
   const distribution = staged.distribution;
   if (typeof distribution !== "string") {
     throw new Error(`${stagedHarnessData}: distribution must be a string`);
@@ -6702,7 +6798,8 @@ function prepareRefreshSource(
   }
   if (
     regularFile(currentHarnessData) ||
-    diagnosticsOverride !== undefined
+    diagnosticsOverride !== undefined ||
+    previewRecorded
   ) {
     writeFileSync(stagedHarnessData, `${JSON.stringify(staged, null, 2)}\n`);
     regenerated.add(`${descriptor.harnessDir}/tools/data/harness.json`);
@@ -6712,6 +6809,9 @@ function prepareRefreshSource(
     descriptor.harnessDir,
     modelHarness(distribution),
     modelPolicy,
+    undefined,
+    agentModelsBuild,
+    agentModelsTakeOut,
   );
   applyProjectFlagsToProjection(
     root,
@@ -8534,7 +8634,7 @@ function renderFirstRunEnding(
     `(${choices.candidate.descriptor.harnessDir}/ and aidlc/, ${count} files)`,
   );
   const harness = modelHarness(choices.candidate.stamp.distribution);
-  if (choices.preset === "unchanged" && sessionSetsAgentModels(harness)) {
+  if (choices.preset === "unchanged" && presetsChangeNothing(harness)) {
     writeMenuRow("  Model preset ... not needed  ", `(${sessionModelsDetail(harness, null)})`);
   } else if (choices.preset === "unchanged") {
     process.stdout.write("  Model preset ... left unchanged\n");
@@ -8851,7 +8951,7 @@ function writeKiroPresetRows(model: string | null, context: "setup" | "models" =
 // A preset changes nothing where agents always run on the session's model and
 // effort, so setup records none there unless the person picks one.
 function firstRunDefaultPreset(distribution: string): FirstRunChoices["preset"] {
-  return sessionSetsAgentModels(modelHarness(distribution)) ? "unchanged" : "balanced";
+  return presetsChangeNothing(modelHarness(distribution)) ? "unchanged" : "balanced";
 }
 
 function providerForHarness(
@@ -9015,7 +9115,7 @@ function customizeFirstRun(
       process.stdout.write("  Step 3 of 6 - Model effort preset\n");
       if (choices.candidate.stamp.distribution === "kiro") {
         writeKiroPresetRows(choices.kiro ? choices.kiro.setModel?.id ?? choices.kiro.session.model : null);
-      } else if (sessionSetsAgentModels(modelHarness(choices.candidate.stamp.distribution))) {
+      } else if (presetsChangeNothing(modelHarness(choices.candidate.stamp.distribution))) {
         writeMenuRow(
           "  ",
           `A preset changes nothing here: ${sessionModelsDetail(modelHarness(choices.candidate.stamp.distribution), null)}.`,
@@ -9275,7 +9375,7 @@ async function runFirstRunWizard(projectDir: string): Promise<boolean> {
         : "current model provider preserved"
     }`,
   );
-  if (HARNESS_HONESTY[modelHarness(candidate.stamp.distribution)].groupEffort) {
+  if (modelHarnessHonesty(modelHarness(candidate.stamp.distribution)).groupEffort) {
     writeMenuRow(
       recommendedDetail,
       "Records balanced (default): medium project agent effort for deciding,",
@@ -9286,7 +9386,7 @@ async function runFirstRunWizard(projectDir: string): Promise<boolean> {
       recommendedDetail,
       "Records balanced (default): medium effort for the whole interactive Kiro CLI session, saved in your personal Kiro settings for every Kiro project; an effort you already saved for your model stays.",
     );
-  } else if (sessionSetsAgentModels(modelHarness(candidate.stamp.distribution))) {
+  } else if (presetsChangeNothing(modelHarness(candidate.stamp.distribution))) {
     writeMenuRow(
       recommendedDetail,
       `Records no model preset: ${sessionModelsDetail(modelHarness(candidate.stamp.distribution), null)}.`,
@@ -10830,6 +10930,7 @@ function prepareModelsSection(
   const resolved = resolveAidlcSettings(projectDir);
   const current = modelPolicyForHarness(resolved.models, harness);
   const tiers = readAgentTiers(selected.root);
+  const installedBuild = installedModelBuild(selected.root, selected.frameworkVersion);
   if (argv.includes("--show")) {
     showModels(current, tiers, harness, projectDir, resolved, options);
     return null;
@@ -10840,6 +10941,7 @@ function prepareModelsSection(
       selected.harnessDir,
       harness,
       current,
+      installedBuild,
     );
     emitResult(
       drift.length === 0
@@ -10979,7 +11081,13 @@ function prepareModelsSection(
   // setting leaves their saved effort alone.
   const kiroSessionRequest = sessionModel !== undefined ||
     (kiroCli && (argv.includes("--preset") || argv.includes("--from")));
-  if (canonical(targetCurrentSettings) === canonical(targetNextSettings)) {
+  // On kiro-ide an unchanged policy still goes through when the agent files
+  // lost what agent-models applies.
+  const settingsUnchanged = canonical(targetCurrentSettings) === canonical(targetNextSettings);
+  const kiroIdeProjectionDue = settingsUnchanged && selected.distribution === "kiro-ide" &&
+    kiroAgentModelsOn(installedBuild) &&
+    modelPolicySurfaceDrift(projectDir, selected.harnessDir, harness, current, installedBuild, false).length > 0;
+  if (settingsUnchanged && !kiroIdeProjectionDue) {
     // The recorded policy is already this, but the person's Kiro session may
     // not carry it yet (a new model, or an effort changed inside Kiro).
     if (kiroSessionRequest && (sessionModel !== undefined || currentKiroPreset)) {
@@ -11040,7 +11148,7 @@ function prepareModelsSection(
       cancelled: "model policy change cancelled",
     };
   }
-  const summary = modelSummaryLines(current, next, tiers, harness, projectDir);
+  const summary = modelSummaryLines(current, next, tiers, harness, projectDir, installedBuild);
   return {
     ...(kiroPlan ? { kiro: kiroPlan } : {}),
     ...(kiroNote ? { kiroNote } : {}),
@@ -11054,12 +11162,361 @@ function prepareModelsSection(
       tiers,
       summaryLines: summary.lines,
       notes: summary.notes,
-      settings: {
-        target,
-        path: targetPath,
-        previous: targetCurrentSettings,
-        next: targetNextSettings,
-      },
+      ...(settingsUnchanged ? {} : {
+        settings: {
+          target,
+          path: targetPath,
+          previous: targetCurrentSettings,
+          next: targetNextSettings,
+        },
+      }),
+    },
+  };
+}
+
+// `config preview`: the switch of a preview feature, recorded in the selected
+// harness tree's harness.json (aidlc-channel.ts PREVIEW_FEATURES_RECORD), so a
+// later config run, a chat and a review read the same choice.
+type PreviewRequest = { feature: PreviewFeature; choice: PreviewChoice };
+
+const PREVIEW_VALUE_FLAGS = new Set(["--harness", "--plan-token", "--project-dir"]);
+const PREVIEW_BARE_FLAGS = new Set(["--dry-run", "--help", "--json", "--no-color", "--quiet", "--show", "--verbose", "--yes"]);
+
+// What each feature does while it is on, and when turning it on or off reaches the work.
+const PREVIEW_FEATURE_TEXT: Readonly<Record<PreviewFeature, { does: string; takes: string; stops: string }>> = Object.freeze({
+  "agent-models": {
+    does: "an agent's own model and effort from config models are written into its Kiro agent file",
+    takes: "Kiro takes it at each agent's next dispatch",
+    stops: "it stops at each agent's next dispatch",
+  },
+  "reviewer-read-scope": {
+    does: "a Unit's reviewer reads only that Unit's files, while the reviewer read-scope check is on for the work",
+    takes: "it applies from the next Unit review",
+    stops: "it stops from the next Unit review",
+  },
+});
+
+// The words after `preview`: a feature and its choice, or nothing to list.
+function previewWords(argv: readonly string[]): string[] {
+  return configPositionals(argv).map((item) => item.value);
+}
+
+function validatePreviewArgs(argv: readonly string[]): string | null {
+  const target = ["--local", "--project", "--global"].find((flag) => argv.includes(flag));
+  if (target) {
+    return `${target} does not apply to config preview: a preview feature is recorded in this project's harness tree (tools/data/harness.json), not in a settings file; omit ${target}`;
+  }
+  const words = previewWords(argv);
+  const positions = new Set(configPositionals(argv).map((item) => item.index));
+  const flags = argv.filter((_, index) => !positions.has(index));
+  // `--download` as every section takes it: the fix a missing release prints.
+  const download = validateDownloadArgs(flags, false);
+  if (download) return download;
+  const grammar = validateConfigOptionGrammar(flags, "preview", {
+    ...withDownloadGrammar(flags, { values: PREVIEW_VALUE_FLAGS, bare: PREVIEW_BARE_FLAGS }),
+    invalidKnownMessage: (flag) => `${flag} is not valid for config preview`,
+  });
+  if (grammar) return grammar;
+  const output = validateConfigOutputMode(argv);
+  if (output) return output;
+  const known = PREVIEW_FEATURES.join(", ");
+  if (words.length === 0) {
+    return ["--dry-run", "--yes", "--download"].some((flag) => argv.includes(flag))
+      ? `name the feature to change: config preview <feature> <on|off> (${known})`
+      : null;
+  }
+  if (!isPreviewFeature(words[0])) return `unknown preview feature ${JSON.stringify(words[0])}; preview features: ${known}`;
+  if (words.length === 1 || (words[1] !== "on" && words[1] !== "off")) {
+    return `config preview ${words[0]} takes on or off`;
+  }
+  if (words.length > 2) return `unexpected preview positional ${JSON.stringify(words[2])}`;
+  if (argv.includes("--show")) return "--show cannot be combined with a preview feature change";
+  return null;
+}
+
+function previewHelp(): string {
+  const invoke = configInvocationFor();
+  const out = process.stdout;
+  return [
+    "Turn a preview feature on or off for this project",
+    "",
+    heading("USAGE", out),
+    `  ${cmd(`${invoke} config preview [--json]`, out)}`,
+    `  ${cmd(`${invoke} config preview <feature> <on|off> [--dry-run] [--yes] [--download]`, out)}`,
+    "",
+    heading("FEATURES", out),
+    ...PREVIEW_FEATURES.map((feature) => `  ${feature}  ${PREVIEW_FEATURE_TEXT[feature].does}`),
+    "",
+    "A preview feature applies only on a preview release of AI-DLC, and only once turned on;",
+    "the choice is recorded in this project's harness tree (tools/data/harness.json). Off works",
+    "on any release. Both features are Kiro's (kiro-ide); --harness picks the tree when the",
+    "project has more than one. --download goes with a change, as in the other sections.",
+    "",
+    heading("EXAMPLE", out),
+    `  ${cmd(`${invoke} config preview agent-models on --yes`, out)}`,
+  ].join("\n");
+}
+
+// One feature in one tree: what is recorded and whether it applies.
+function previewFeatureStates(tree: ProjectHarness): Array<{
+  harness: string;
+  feature: PreviewFeature;
+  recorded: PreviewChoice | null;
+  on: boolean;
+}> {
+  return PREVIEW_FEATURES.filter((feature) => PREVIEW_FEATURE_HARNESSES[feature].includes(tree.distribution))
+    .map((feature) => {
+      const state = treePreviewFeature(tree.root, feature);
+      return { harness: tree.distribution, feature, recorded: state.recorded, on: state.on };
+    });
+}
+
+function showPreviewFeatures(
+  projectDir: string,
+  trees: readonly ProjectHarness[],
+  options: ReturnType<typeof globalOptions>,
+): void {
+  const features = trees.flatMap((tree) =>
+    previewFeatureStates(tree).map((state) => ({
+      ...state,
+      version: tree.frameworkVersion ?? AIDLC_VERSION,
+      path: `${tree.harnessDir}/tools/data/harness.json`,
+    }))
+  );
+  if (options.mode !== "human") {
+    emitResult(success("preview features", { features }), options);
+    return;
+  }
+  const out = process.stdout;
+  let output = `${heading("Preview features", out)}\n\n`;
+  if (features.length === 0) {
+    output += `  none for ${trees.map((tree) => HARNESS_PRODUCT_NAMES[modelHarness(tree.distribution)]).join(", ")}\n`;
+    writeMenuText(output);
+    process.exitCode = EXIT.ok;
+    return;
+  }
+  for (const tree of trees) {
+    const states = features.filter((state) => state.harness === tree.distribution);
+    if (states.length === 0) {
+      output += `${HARNESS_PRODUCT_NAMES[modelHarness(tree.distribution)]} (${tree.harnessDir}): none\n`;
+      continue;
+    }
+    const version = tree.frameworkVersion ?? AIDLC_VERSION;
+    const preview = versionChannel(version) === PREVIEW_CHANNEL;
+    output += `${HARNESS_PRODUCT_NAMES[modelHarness(tree.distribution)]} (${tree.harnessDir}, ${version}):\n`;
+    for (const state of states) {
+      output += `  ${state.feature}: ${state.on ? "on" : "off"}${
+        state.recorded === "on" && !state.on ? " (recorded on; this release is not a preview release)" : state.recorded === null ? " (not set)" : ""
+      }\n    ${PREVIEW_FEATURE_TEXT[state.feature].does}.\n`;
+    }
+    if (preview) {
+      output += `  Turn one on or off: ${previewCommand(projectDir, tree.distribution, "<feature> <on|off> --yes")}\n`;
+    } else {
+      output += "  Preview features apply only on a preview release of AI-DLC.\n";
+      if (states.some((state) => state.recorded === "on")) {
+        output += `  ${previewCommand(projectDir, tree.distribution, "<feature> off --yes")} clears one recorded on.\n`;
+      }
+    }
+  }
+  writeMenuText(output);
+  process.exitCode = EXIT.ok;
+}
+
+// The line for a change of a preview feature: where it is kept, when the work
+// takes it, and its undo, back to what applied before.
+export function previewSwitchLine(
+  projectDir: string,
+  tree: ProjectHarness,
+  feature: PreviewFeature,
+  before: PreviewChoice | null,
+  beforeOn: boolean,
+  to: PreviewChoice,
+  version: string,
+  pin: string | null,
+): string {
+  const head = before === to
+    ? `  Preview feature ${feature}: ${to}, as recorded in ${tree.harnessDir}/tools/data/harness.json`
+    : `  Preview feature ${feature}: ${before ?? "not set"} -> ${to} in ${tree.harnessDir}/tools/data/harness.json`;
+  // Back to what applied on the installed tree; `version` is the release this
+  // run sets up, where on runs only on a preview release, so elsewhere the way
+  // back is the steps to one.
+  const back = beforeOn ? "on" : "off";
+  const command = (choice: PreviewChoice) => previewCommand(projectDir, tree.distribution, `${feature} ${choice} --yes`);
+  const on = versionChannel(version) === PREVIEW_CHANNEL
+    ? command("on")
+    : previewReleaseSteps(projectDir, command("on"), pin);
+  const undo = back !== to
+    ? ` To undo: ${back === "on" ? on : command("off")}`
+    : before === "on" && !beforeOn
+    ? ` To have it again: ${on}`
+    : "";
+  // What applies after the run, against what applied before it: a switch
+  // that changes nothing in effect (on to off on a stable release) says so.
+  const takes = previewFeatureOn(feature, { [feature]: to }, version)
+    ? PREVIEW_FEATURE_TEXT[feature].takes
+    : beforeOn
+    ? PREVIEW_FEATURE_TEXT[feature].stops
+    : "nothing changes on this release";
+  return `${head}; ${takes}.${undo}`;
+}
+
+// The project's pin, when `.aidlc-version` names one release; the config run
+// itself refuses any other content.
+function previewPin(projectDir: string): string | null {
+  const pin = join(projectDir, ".aidlc-version");
+  const pinned = regularFile(pin) ? readFileSync(pin, "utf-8").trim() : "";
+  return VERSION_ID.test(pinned) ? pinned : null;
+}
+
+// The one refusal of `on`, for a release that is not a preview one: said
+// before the question from the installed tree and its pin, and by the run on
+// the release it selects.
+function previewOnRefusal(
+  projectDir: string,
+  distribution: string,
+  feature: PreviewFeature,
+  version: string,
+  pin: string | null,
+): { message: string; steps: string } | null {
+  if (versionChannel(version) === PREVIEW_CHANNEL || (pin !== null && versionChannel(pin) === PREVIEW_CHANNEL)) return null;
+  return {
+    message: `${feature} needs this project on a preview release of AI-DLC; it is on ${version}${
+      pin !== null && pin !== version ? `, pinned to ${pin}` : ""
+    }`,
+    steps: previewReleaseSteps(projectDir, previewCommand(projectDir, distribution, `${feature} on --yes`), pin),
+  };
+}
+
+// How to get the preview release the project needs, as commands, ending with
+// the command to run again there. A copied runtime has no release channel to
+// follow: it takes a preview copy instead.
+function previewReleaseSteps(projectDir: string, rerun: string, pinned: string | null): string {
+  const invoke = configInvocationFor(projectDir);
+  if (invoke !== "aidlc") {
+    return `install a preview release's copy runtime into this project (Release Channels in the install guide), then ${rerun}`;
+  }
+  const target = projectTarget(projectDir);
+  return [
+    ...(pinned ? [`aidlc config --unpin${target} (this project is pinned to ${pinned} in .aidlc-version)`] : []),
+    "aidlc config --channel preview",
+    "aidlc update",
+    `aidlc config${target}`,
+    rerun,
+  ].join(", then ");
+}
+
+function preparePreviewSection(
+  argv: string[],
+  options: ReturnType<typeof globalOptions>,
+): { argv: string[]; context: ModelsMutationContext } | null {
+  if (argv.includes("--help")) {
+    process.stdout.write(`${previewHelp()}\n`);
+    process.exitCode = EXIT.ok;
+    return null;
+  }
+  const validation = validatePreviewArgs(argv);
+  if (validation) {
+    emitResult(usage(validation, configCommand("preview --help")), options);
+    return null;
+  }
+  const projectDir = projectDirFrom(argv);
+  const requested = valueAfter(argv, "--harness");
+  const harnesses = discoverProjectHarnesses(projectDir);
+  const chosen = requested ? harnesses.filter((candidate) => candidate.distribution === requested) : harnesses;
+  if (chosen.length === 0) {
+    emitResult(
+      usage(
+        requested && harnesses.length > 0
+          ? `project uses ${harnesses.map((item) => item.distribution).join(", ")}; refusing ${requested}`
+          : `${configCommand("preview")} requires an installed project harness; run ${configCommand()} first`,
+      ),
+      options,
+    );
+    return null;
+  }
+  const words = previewWords(argv);
+  if (words.length === 0) {
+    showPreviewFeatures(projectDir, chosen, options);
+    return null;
+  }
+  if (chosen.length > 1) {
+    emitResult(usage("multiple project harnesses are present; pass one --harness <name>"), options);
+    return null;
+  }
+  const tree = chosen[0];
+  const feature = words[0] as PreviewFeature;
+  const choice = words[1] as PreviewChoice;
+  if (!PREVIEW_FEATURE_HARNESSES[feature].includes(tree.distribution)) {
+    emitResult(
+      usage(
+        `${feature} is a preview feature of ${PREVIEW_FEATURE_HARNESSES[feature].join(", ")} projects; this one uses ${tree.distribution}`,
+        configCommand("preview --help"),
+      ),
+      options,
+    );
+    return null;
+  }
+  // What applies now is the installed tree's; a pin to another release is
+  // the run's to set up, and the run checks on again on the release it selects.
+  const state = treePreviewFeature(tree.root, feature);
+  const version = state.version;
+  const recorded = state.recorded;
+  const pin = previewPin(projectDir);
+  const refusal = choice === "on" ? previewOnRefusal(projectDir, tree.distribution, feature, version, pin) : null;
+  if (refusal) {
+    emitResult(usage(refusal.message, refusal.steps), options);
+    return null;
+  }
+  // Nothing recorded is off, so off there changes nothing and records nothing;
+  // an on that is recorded but not applied, or a pin to another release, goes
+  // on to the run.
+  if ((recorded ?? "off") === choice && (choice === "off" || (state.on && (pin === null || pin === version)))) {
+    emitResult(success(`${feature} is already ${choice} for this project`, { feature, choice }), options);
+    return null;
+  }
+  let confirm: PendingConfirm | undefined;
+  if (!argv.includes("--dry-run") && !options.yes) {
+    if (!configInputIsTty()) {
+      emitResult(
+        usage(
+          "non-interactive preview feature change requires --yes",
+          configMutationRerun("preview", argv),
+        ),
+        options,
+      );
+      return null;
+    }
+    confirm = { question: `Turn ${feature} ${choice}?`, cancelled: "preview feature change cancelled" };
+  }
+  const harness = modelHarness(tree.distribution);
+  const current = modelPolicyForHarness(resolveAidlcSettings(projectDir).models, harness);
+  const tiers = readAgentTiers(tree.root);
+  // Off says its way back in the switch line itself, and what becomes of a
+  // recorded per-agent model or effort.
+  const ownSettings = Object.values(normalizeModelPolicy(current)?.agents ?? {})
+    .some((agent) => agent.model !== undefined || agent.effort !== undefined);
+  const previewLines = (selected: string) => ({
+    summaryLines: [previewSwitchLine(projectDir, tree, feature, recorded, state.on, choice, selected, pin)],
+    notes: feature !== KIRO_AGENT_MODELS_FEATURE
+      ? []
+      : choice === "on"
+      ? modelSummaryLines(current, current, tiers, harness, projectDir, { version: selected, agentModels: choice }).notes
+      : ownSettings && state.on
+      ? [KIRO_AGENT_MODELS_OFF_NOTE]
+      : [],
+  });
+  return {
+    argv: modelsPipelineArgv(argv),
+    context: {
+      confirm,
+      harness,
+      harnessDir: tree.harnessDir,
+      previous: current,
+      next: current,
+      tiers,
+      ...previewLines(version),
+      preview: { feature, choice },
+      previewLines,
     },
   };
 }
@@ -12221,8 +12678,8 @@ export async function main(
     }
     emitResult(
       usage(
-        `unknown config section ${JSON.stringify(section.value)}; valid sections: models, runtime, providers, trust, flags, project`,
-        configCommand("<models|runtime|providers|trust|flags|project> --help"),
+        `unknown config section ${JSON.stringify(section.value)}; valid sections: ${CONFIG_SECTIONS.join(", ")}`,
+        configCommand(`<${CONFIG_SECTIONS.join("|")}> --help`),
       ),
       options,
     );
@@ -12252,7 +12709,12 @@ export async function main(
   let pendingKiroSession: KiroSessionPlan | null = null;
   let diagnosticsContext: DiagnosticsMutationContext | null = null;
   let choicesContext: ChoicesMutationContext | null = null;
-  if (section?.value === "models") {
+  if (section?.value === "preview") {
+    const prepared = preparePreviewSection([...argv.slice(0, section.index), ...argv.slice(section.index + 1)], options);
+    if (!prepared) return;
+    argv = prepared.argv;
+    modelsContext = prepared.context;
+  } else if (section?.value === "models") {
     argv = [...argv.slice(0, section.index), ...argv.slice(section.index + 1)];
     try {
       const preparedModels = prepareModelsSection(argv, options);
@@ -12902,6 +13364,13 @@ export async function main(
       projectedSettings.models,
       modelHarness(stamp.distribution),
     );
+    // A preview feature turned on is checked against the release this run sets
+    // up, which a pin can make another one than the installed tree's.
+    const onRefusal = modelsContext?.preview?.choice === "on"
+      ? previewOnRefusal(projectDir, stamp.distribution, modelsContext.preview.feature, stamp.frameworkVersion, previewPin(projectDir))
+      : null;
+    if (onRefusal) throw new SwitchRefusal(onRefusal.message, { kind: "text", text: onRefusal.steps });
+    if (modelsContext?.previewLines) Object.assign(modelsContext, modelsContext.previewLines(stamp.frameworkVersion));
     prepared = prepareRefreshSource(
       projectDir,
       selected.root,
@@ -12913,6 +13382,10 @@ export async function main(
       Boolean(selected.projectProjection),
       diagnosticsContext?.overrides ?? choicesContext?.overrides,
       argv.includes("--force"),
+      {
+        version: stamp.frameworkVersion,
+        ...(modelsContext?.preview ? { request: modelsContext.preview } : {}),
+      },
     );
     prepared.notes.unshift(...sourceNotes);
     // A release that no longer ships AI-DLC's status line in the shared Claude
@@ -13214,6 +13687,7 @@ export async function main(
     if (kiroUpgraded > 0) prepared.notes.push(kiroUpgradedNote(kiroUpgraded, descriptor.harnessDir, kiroForce));
     const kiroKeptChanged = actions.filter((action) => action.detail === KIRO_KEPT_CHANGED_DETAIL).length;
     if (kiroKeptChanged > 0) prepared.notes.push(kiroKeptChangedNote(kiroKeptChanged, descriptor.harnessDir, kiroForce));
+
     // Older releases shipped an effort map in the project's Kiro settings; a
     // refresh that removes it says where the session's effort lives now.
     const legacyKiroMap = stamp.distribution === "kiro" &&
@@ -13326,7 +13800,7 @@ export async function main(
       }
       const configuredSection = diagnosticsContext?.section ??
         choicesContext?.section ??
-        (modelsContext ? "models" : null);
+        (modelsContext ? (modelsContext.preview ? "preview" : "models") : null);
       emitResult(success(
         withQuietWarnings(`${configuredSection ? `${configuredSection} configuration` : "config"} plan for ${projectDir}${
           switchingFrom
@@ -13347,6 +13821,7 @@ export async function main(
                 models: {
                   previous: modelsContext.previous,
                   next: modelsContext.next,
+                  ...(modelsContext.preview ? { preview: modelsContext.preview } : {}),
                   summaries: modelsContext.summaryLines,
                   notes: modelsContext.notes,
                 },
@@ -13547,6 +14022,7 @@ export async function main(
     // rewrites; a harness whose agents inherit the session says so in a note.
     // Kiro CLI reads its agent files and its cli.json effort only when a
     // session starts, so there the change reaches open work from the next one.
+    // kiro-ide's Kiro reads a delegated agent's file at each dispatch.
     const policyHarness = modelHarness(descriptor.distribution);
     const agentsDir = modelPolicyAgentsDir(policyHarness, descriptor.harnessDir);
     const kiroCliSettings = policyHarness === "kiro" ? `${descriptor.harnessDir}/settings/cli.json` : null;
@@ -13662,7 +14138,7 @@ export async function main(
       : diagnosticsContext
       ? `configured ${diagnosticsContext.section} settings for ${projectDir}`
       : modelsContext
-      ? `configured model policy for ${projectDir}`
+      ? `configured ${modelsContext.preview ? "preview features" : "model policy"} for ${projectDir}`
       : `configured ${projectDir} for ${descriptor.productName} ${stamp.frameworkVersion}${
         switchingFrom
           ? `, switched ${descriptor.harnessDir} in place from ${switchingFrom.distribution} to ${stamp.distribution} (aidlc/ kept)`
@@ -13714,6 +14190,7 @@ export async function main(
               models: {
                 previous: modelsContext.previous,
                 next: modelsContext.next,
+                ...(modelsContext.preview ? { preview: modelsContext.preview } : {}),
                 summaries: modelsContext.summaryLines,
                 notes: modelsContext.notes,
               },
