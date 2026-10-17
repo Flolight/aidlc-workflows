@@ -55,8 +55,6 @@ const OWN_PICKER_LINES = {
     "GitHub Copilot runs every agent on the model you choose in its model picker (/model in the Copilot CLI), so a model or effort set here is kept for other tools and changes nothing in GitHub Copilot.",
   cursor:
     "Cursor runs every agent on the model you choose in its model picker, so a model or effort set here is kept for other tools and changes nothing in Cursor.",
-  "kiro-ide":
-    "AI-DLC does not write a model or effort into its Kiro agent files, so every agent runs on your chat's model and effort (Kiro IDE's model picker, or Kiro CLI's session model); a model or effort set here is kept for other tools and changes nothing in Kiro.",
   kiro:
     "Kiro CLI runs every agent on your session's model and effort, so an effort set here without a model is kept for other tools and changes nothing in Kiro CLI; a preset (minimal, balanced or thorough) sets the session's effort.",
 } as const;
@@ -308,9 +306,10 @@ describe("t293 model policy resolution", () => {
       schemaVersion: 1,
       agents: { architect: { model: "raw/model", effort: "high" } },
     }, "architect", "judgment", "kiro-ide");
-    expect(ide.model).toBeUndefined();
-    expect(ide.effort).toBeUndefined();
-    expect(ide.unexpressed.sort()).toEqual(["effort", "model"]);
+    // Kiro takes one agent's own model and effort.
+    expect(ide.model).toBe("raw/model");
+    expect(ide.effort).toBe("high");
+    expect(ide.unexpressed).toEqual([]);
 
     const cursor = resolveModelPolicy({
       schemaVersion: 1,
@@ -741,7 +740,7 @@ describe("t293 config models CLI", () => {
     expect(result.status).toBe(2);
     expect(result.stdout).toContain("unknown config section");
     expect(result.stdout).toContain(
-      "valid sections: models, runtime, providers, trust, flags, project, preview",
+      "valid sections: models, runtime, providers, trust, flags, project",
     );
     expect(existsSync(join(project, ".claude"))).toBe(false);
   });
@@ -1155,8 +1154,8 @@ describe("t293 config models CLI", () => {
     expect(effort.stdout).not.toContain("from the next step");
   }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
 
-  test("on Cursor, Kiro IDE and Kiro CLI a model request they cannot apply is kept and names their own picker", () => {
-    for (const harness of ["cursor", "kiro-ide", "kiro"] as const) {
+  test("on Cursor and Kiro CLI a model request they cannot apply is kept and names their own picker", () => {
+    for (const harness of ["cursor", "kiro"] as const) {
       const project = install(harness);
       const result = run([
         "config", "models", "--project-dir", project, "--project", "--agent", "developer", "--effort", "high", "--yes",
@@ -1645,19 +1644,20 @@ describe("t293 doctor model policy advisory", () => {
     const shared = check({ schemaVersion: 1, preset: "balanced", groups: { reviewing: { effort: "max" } } });
     expect(shared.status, shared.stdout).toBe(0);
     expect(shared.stdout).toContain("model policy is reflected on kiro-ide");
-    // A model recorded for Kiro by name is still drift there; its effort is not.
+    // One agent's own model and effort are Kiro's: a file without them is drift.
     const named = check({
       schemaVersion: 1,
       agents: { architect: { model: { "kiro-ide": "claude-sonnet-5.5" }, effort: "high" } },
     });
     expect(named.status).toBe(1);
-    expect(named.stdout).toContain("architect: model policy is not expressible on kiro-ide");
-    expect(named.stdout).not.toContain("architect: effort");
+    expect(named.stdout).toContain("architect: model inherit != claude-sonnet-5.5");
+    expect(named.stdout).toContain("architect: effort inherit != high");
+    expect(named.stdout).not.toContain("not expressible");
   }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
 
-  test("doctor names the session where it sets every agent, and Kiro CLI carries the preset", () => {
+  test("doctor names the session where a preset changes nothing, and Kiro CLI carries the preset", () => {
     // A preset recorded for the team (setup records none on these hosts) is
-    // not a problem to fix where the host cannot pin an agent's model or effort.
+    // not a problem to fix where a preset changes nothing.
     const preset = (project: string) => {
       const settings = projectSettingsPath(project);
       writeFileSync(settings, `${JSON.stringify({
@@ -1666,21 +1666,22 @@ describe("t293 doctor model policy advisory", () => {
       }, null, 2)}\n`);
       invalidateSettingsCache(settings);
     };
-    for (const [harness, product] of [
-      ["copilot", "GitHub Copilot"],
-      ["cursor", "Cursor"],
-      ["kiro-ide", "Kiro"],
+    // Kiro takes one agent's own model and effort, so its line says so.
+    for (const [harness, product, own] of [
+      ["copilot", "GitHub Copilot", ""],
+      ["cursor", "Cursor", ""],
+      ["kiro-ide", "Kiro", " unless a model or effort is set for that agent"],
     ] as const) {
       const project = temp(`aidlc-t293-doctor-session-${harness}-`);
       cpSync(join(DIST, harness), project, { recursive: true });
       expect(modelsPolicyCheck(project, true), harness).toEqual({
         pass: true,
-        label: `Models: every agent uses your ${product} session's model and effort`,
+        label: `Models: every agent uses your ${product} session's model and effort${own}`,
       });
       preset(project);
       expect(modelsPolicyCheck(project, true), harness).toEqual({
         pass: true,
-        label: `Models: every agent uses your ${product} session's model and effort; ` +
+        label: `Models: every agent uses your ${product} session's model and effort${own}; ` +
           "the recorded balanced preset does not apply here",
       });
     }
@@ -1739,7 +1740,7 @@ describe("t293 doctor model policy advisory", () => {
     const inert = "the recorded balanced preset does not apply here";
     expect(modelsPolicyCheck(hosts, true)).toEqual({
       pass: true,
-      label: `Models: every agent uses your Kiro session's model and effort; ${inert}; ` +
+      label: `Models: every agent uses your Kiro session's model and effort unless a model or effort is set for that agent; ${inert}; ` +
         `every agent uses your Cursor session's model and effort; ${inert}`,
     });
   });
