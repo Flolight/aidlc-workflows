@@ -230,7 +230,7 @@ describe("t05 run-tests.sh --parallel flag (migrated from t05-run-tests-parallel
     expect(r.out).not.toContain("=== START");
   }, PER_TEST_TIMEOUT);
 
-  test.each([12, 16])("%i weighted unit shards cover every file once and preserve binary affinity", (total) => {
+  test.each([10, 16])("%i weighted unit shards cover every file once and preserve binary affinity", (total) => {
     const files = readdirSync(join(TESTS_ROOT, "unit"))
       .filter((file) => file.endsWith(".test.ts"))
       .sort();
@@ -285,7 +285,7 @@ describe("t05 run-tests.sh --parallel flag (migrated from t05-run-tests-parallel
     const execution = JSON.parse(readFileSync(join(stamp!, file.replace(/\.test\.ts$/, ".execution.json")), "utf8"));
     expect(execution.noLlm).toBe(true);
     expect(r.out).toContain(
-      `## Unit Tests (single-component isolation) (shard=${selected}/8)`,
+      `## Unit Tests (unit, process, and workflow contracts) (shard=${selected}/8)`,
     );
     expect(r.out).toContain(`=== START ${file} ===`);
     expect(r.out).toContain("Test files: 1");
