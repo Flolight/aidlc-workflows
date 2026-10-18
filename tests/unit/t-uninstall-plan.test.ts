@@ -19,8 +19,8 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { renderCompletion, type Shell } from "../../core/tools/aidlc-completions.ts";
-import { preservedUninstallPaths, untrustedPathList, windowsPosixShim } from "../../core/tools/aidlc-lifecycle.ts";
-import { buildUninstallPlan } from "../../core/tools/aidlc-uninstall-plan.ts";
+import { preservedUninstallPaths, windowsPosixShim } from "../../core/tools/aidlc-lifecycle.ts";
+import { buildUninstallPlan, untrustedPathList } from "../../core/tools/aidlc-uninstall-plan.ts";
 
 const VERSION = "1.2.3";
 const BINARY = process.platform === "win32" ? "aidlc.exe" : "aidlc";
@@ -454,6 +454,53 @@ describe("uninstall file ownership plans", () => {
         JSON.stringify({ schema: 1, producer: "aidlc-plugin-build", plugin: "example", harness: "claude" }));
       const result = plan(fixture);
       expect(result.preserved).toContain(join(release, ".aidlc-plugin-projection.json"));
+    });
+  });
+
+  // AI-DLC's own plugin catalogue at <root>/plugins records the files its last
+  // refresh wrote: those that still match go, anything else there stays.
+  test("the plugin catalogue's recorded files go; changed, extra and linked files stay", () => {
+    withInstall((fixture) => {
+      const catalogue = join(fixture.root, "plugins");
+      const record = join(catalogue, ".aidlc-catalogue.json");
+      const owned = [
+        join(catalogue, ".claude-plugin", "marketplace.json"),
+        join(catalogue, "example", "claude", "stage.md"),
+      ];
+      const changed = join(catalogue, "example", "codex", "stage.md");
+      for (const path of [...owned, changed]) put(path, `catalogue bytes: ${relative(catalogue, path)}\n`);
+      put(record, JSON.stringify({
+        schemaVersion: 1,
+        version: VERSION,
+        files: [...owned, changed].map((path) => row(catalogue, path)),
+      }));
+      put(changed, "user changed this file\n");
+      const extra = join(catalogue, "notes.txt");
+      put(extra, "user-owned sentinel\n");
+      const kept = [changed, extra];
+      if (process.platform !== "win32") {
+        const link = join(catalogue, "linked.md");
+        symlinkSync(join(fixture.base, "outside.txt"), link);
+        kept.push(link);
+      }
+      const result = plan(fixture);
+      const planned = result.files.map((file) => file.path);
+      expect(planned).toEqual(expect.arrayContaining([...owned, record]));
+      expect(result.preserved).toEqual(expect.arrayContaining(kept));
+      for (const path of kept) expect(planned, path).not.toContain(path);
+      expect(result.directories).toContain(catalogue);
+      // The record goes after the files it lists.
+      expect(planned.indexOf(record)).toBeGreaterThan(Math.max(...owned.map((path) => planned.indexOf(path))));
+    });
+  });
+
+  test("a plugin catalogue without its record is kept whole", () => {
+    withInstall((fixture) => {
+      const catalogue = join(fixture.root, "plugins");
+      put(join(catalogue, ".claude-plugin", "marketplace.json"), "{}\n");
+      const result = plan(fixture);
+      expect(result.preserved).toContain(catalogue);
+      expect(result.files.some((file) => file.path.startsWith(`${catalogue}${sep}`))).toBe(false);
     });
   });
 
