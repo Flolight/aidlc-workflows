@@ -409,6 +409,13 @@ type PreparedRefreshSource = {
   composedRecords?: ReadonlyMap<string, string>;
   /** Composed files this row no longer ships whose record proves them AI-DLC's. */
   provenRetired?: ReadonlySet<string>;
+  /**
+   * Release files the model writer filled in, with the release's own hash: the
+   * ownership check still holds them, as it holds every shipped file.
+   */
+  modelWritten?: ReadonlyMap<string, string>;
+  /** Every file whose content the model writer changed, the project's own copy included. */
+  modelStamped?: ReadonlySet<string>;
   entries?: Baseline["entries"];
   notes: string[];
 };
@@ -6749,12 +6756,26 @@ function prepareRefreshSource(
     writeFileSync(stagedHarnessData, `${JSON.stringify(staged, null, 2)}\n`);
     regenerated.add(`${descriptor.harnessDir}/tools/data/harness.json`);
   }
+  const modelWrites: string[] = [];
   applyModelPolicyToProjection(
     root,
     descriptor.harnessDir,
     modelHarness(distribution),
     modelPolicy,
+    undefined,
+    modelWrites,
   );
+  // A model or effort written into a release's agent file makes it differ from
+  // the release, which alone would mark it regenerated and copy it over the
+  // person's edit. On a copied project's own files the writer keeps the edit.
+  const modelStamped = new Set(modelWrites.map((path) => relative(root, path).replaceAll("\\", "/")));
+  const modelWritten = new Map<string, string>();
+  if (!projectProjection) {
+    for (const rel of modelStamped) {
+      const releaseHash = beforeGeneratedWrites.get(rel);
+      if (releaseHash !== undefined) modelWritten.set(rel, releaseHash);
+    }
+  }
   applyProjectFlagsToProjection(
     root,
     descriptor.harnessDir,
@@ -6989,6 +7010,7 @@ function prepareRefreshSource(
     const currentHash = sha256Bytes(current);
     const strippedHash = sha256Bytes(stripRecordedContributions(current, record));
     if (priorHash && currentHash !== priorHash && strippedHash !== priorHash) continue;
+    modelWritten.delete(rel);
     // A file this row no longer ships is AI-DLC's to remove.
     if (!existsSync(stagedPath)) {
       if (priorHash) provenRetired.add(rel);
@@ -7039,8 +7061,11 @@ function prepareRefreshSource(
     if (prior) regenerated.add(rel);
     // The record holds the file without the plugin's additions, as config
     // records it before any compose, so the test above still proves it after
-    // a later compose rewrites them.
-    composedRecords.set(rel, sha256Bytes(stripRecordedContributions(fresh, { ...record, requires_stage: replayedEdges })));
+    // a later compose rewrites them. It reads the file with LF, as that test
+    // does, so a CRLF copy (and one the model writer gave LF frontmatter) is
+    // still the same file.
+    const asRead = fresh.replaceAll("\r\n", "\n");
+    composedRecords.set(rel, sha256Bytes(stripRecordedContributions(asRead, { ...record, requires_stage: replayedEdges })));
   }
   const emptiedSidecars = new Set<string>();
   if (retiredEdges.size > 0 && pathPresent(dataDir) && lstatSync(dataDir).isDirectory()) {
@@ -7227,6 +7252,8 @@ function prepareRefreshSource(
     emptiedSidecars,
     composedRecords,
     provenRetired,
+    modelWritten,
+    modelStamped,
     entries,
     notes,
   };
@@ -9633,6 +9660,8 @@ function planManagedFiles(
   unproven: ReadonlySet<string> = new Set(),
   composedRecords: ReadonlyMap<string, string> = new Map(),
   provenRetired: ReadonlySet<string> = new Set(),
+  modelWritten: ReadonlyMap<string, string> = new Map(),
+  modelStamped: ReadonlySet<string> = new Set(),
 ): void {
   const shipped = new Set<string>();
   for (const directory of descriptor.managedDirectories) {
@@ -9648,10 +9677,13 @@ function planManagedFiles(
       const targetRegular = targetExists && lstatSync(target).isFile();
       const hash = sha256File(source);
       const priorHash = prior?.files[rel];
+      // The release's own file, before the model writer filled it in, is
+      // AI-DLC's as much as the filled-in one.
+      const releaseHash = modelWritten.get(rel);
       // A copy Git checked out with other line endings is the file it was, and
       // so is an include a space switch pointed at another space.
       const owned = targetRegular
-        ? ownedFileHash(target, [hash, priorHash, ...(descriptor.legacyManagedFileHashes?.[rel] ?? [])])
+        ? ownedFileHash(target, [hash, priorHash, releaseHash, ...(descriptor.legacyManagedFileHashes?.[rel] ?? [])])
         : undefined;
       const currentHash = owned?.hash;
       const adoptedManagedFile = prior === null &&
@@ -9684,12 +9716,17 @@ function planManagedFiles(
       }
       if (!projectOwned && !unbaselinedGenerated(descriptor.harnessDir).includes(rel)) {
         // In-place answers can advance ownership only from an unmodified base.
+        // A composed agent file is recorded without the plugin's additions, so
+        // the plugin replay, which re-applies them only over that record, is
+        // its proof; a model written into it then reaches the record too.
+        const unmodified = currentHash === priorHash ||
+          (priorHash !== undefined && modelStamped.has(rel) && composedRecords.has(rel));
         const nextHash = retainBaseline
-          ? regenerated.has(rel) && targetRegular && currentHash === priorHash ? composedRecords.get(rel) ?? hash : priorHash
+          ? regenerated.has(rel) && targetRegular && unmodified ? composedRecords.get(rel) ?? hash : priorHash
           : composedRecords.get(rel) ?? hash;
         if (nextHash !== undefined) nextHashes[rel] = nextHash;
       }
-      if (runtimeGenerated(rel, descriptor.harnessDir, regenerated)) {
+      if (runtimeGenerated(rel, descriptor.harnessDir, regenerated) && !modelWritten.has(rel)) {
         if (targetRegular && currentHash === hash) {
           actions.push({ path: rel, action: "preserve", detail: "runtime-generated" });
           continue;
@@ -9785,7 +9822,7 @@ function planManagedFiles(
         (
           !targetRegular ||
           unproven.has(rel) ||
-          (!adoptedManagedFile && (!priorHash || currentHash !== priorHash))
+          (!adoptedManagedFile && currentHash !== releaseHash && (!priorHash || currentHash !== priorHash))
         ) &&
         !force
       ) {
@@ -13142,6 +13179,8 @@ export async function main(
       prepared.unproven,
       prepared.composedRecords,
       prepared.provenRetired,
+      prepared.modelWritten,
+      prepared.modelStamped,
     );
     for (const rel of prepared.retiredManagedFiles) {
       const target = join(projectDir, rel);
