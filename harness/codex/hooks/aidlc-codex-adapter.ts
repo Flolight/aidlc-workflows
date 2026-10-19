@@ -16,8 +16,9 @@
 //   2. The plan tool is update_plan ({plan:[{step,status}]}), not
 //      TaskUpdate — the shim maps the in_progress step to the
 //      {status, activeForm} shape the statusline-sync hook keys on.
-//   3. Every event is delivered TWICE (×2 duplication observed across the
-//      whole corpus). The shim is idempotent by REPLAY: the first delivery
+//   3. An event can be delivered TWICE (×2 duplication seen across the
+//      payload corpus; one delivery per registration on 0.162.1).
+//      The shim is idempotent by REPLAY: the first delivery
 //      runs the core hook and caches {stdout, exit}; the duplicate replays
 //      the identical response (never swallowed — we must answer duplicates
 //      exactly like originals because Codex's combine rule is unspecified).
@@ -253,10 +254,19 @@ const projectEnv = { ...process.env, ...projectPins };
 // --- Duplicate-delivery replay cache ---------------------------------------
 //
 // Key = sha256(target + raw stdin): identical deliveries (same turn, same
-// tool_use_id, same content) collide; legitimate re-fires differ (turn_id /
-// stop_hook_active / tool_use_id change). First delivery takes the slot via
-// atomic mkdir (the audit-lock idiom), runs, and persists its response;
-// the duplicate waits briefly for that response and replays it byte-for-byte.
+// tool_use_id, same content) collide; most legitimate re-fires differ
+// (turn_id / stop_hook_active / tool_use_id change). First delivery takes the
+// slot via atomic mkdir (the audit-lock idiom), runs, and persists its
+// response; the duplicate waits briefly for that response and replays it
+// byte-for-byte.
+//
+// Two re-fires do NOT differ: a person who types the same words again while
+// the turn is still closing (`1` to two numbered questions in a row) lands in
+// the same Codex turn, so the second UserPromptSubmit, and the Stop after it,
+// carry byte-identical stdin (measured on Codex 0.162.1: the payload has no
+// per-submission field). What tells them from Codex's duplicate of one
+// delivery is that the agent has spoken in between, so on those two seams the
+// key also carries the number of assistant messages in the Codex rollout.
 // The cache lives in the project's own gitignored scratch folder
 // (aidlc/.aidlc-sessions/codex-dedupe), never in the OS temp folder, and every
 // delivery prunes it: a slot is kept for 5 minutes at most (the duplicate waits
@@ -271,8 +281,49 @@ const projectEnv = { ...process.env, ...projectPins };
 // re-running a true duplicate is harmless while replaying a stale one is not.
 const bypassReplay = target === "session-start" && codex.source === "compact";
 
+// Measured on 0.162.1: an assistant message is in the rollout before the next
+// UserPromptSubmit and before the Stop that follows it, and a duplicate that
+// comes with its original reads the same count. Only the lines that name the
+// assistant are parsed, and a last line still being written is not counted.
+// Without a readable rollout the key is target and stdin alone.
+const ASSISTANT_ROLE = Buffer.from('"role":"assistant"');
+function assistantMessagesInRollout(transcriptPath: unknown): string {
+  if (typeof transcriptPath !== "string" || rolloutThread(transcriptPath) === null) return "";
+  try {
+    const rollout = readFileSync(transcriptPath);
+    let count = 0;
+    for (let at = rollout.indexOf(ASSISTANT_ROLE); at !== -1; at = rollout.indexOf(ASSISTANT_ROLE, at + 1)) {
+      const end = rollout.indexOf(10, at);
+      if (end === -1) break;
+      try {
+        const line = rollout.subarray(rollout.lastIndexOf(10, at) + 1, end).toString("utf-8");
+        const entry = JSON.parse(line) as { type?: unknown; payload?: { type?: unknown; role?: unknown } };
+        if (entry.type === "response_item" && entry.payload?.type === "message" && entry.payload.role === "assistant") {
+          count++;
+        }
+      } catch {
+        // not a JSON line
+      }
+      at = end;
+    }
+    return `\n${count}`;
+  } catch {
+    return "";
+  }
+}
+// A subagent's prompt (agent_id) or an internal reviewer's (its own rollout)
+// is not the person's turn: record-human-turn records nothing for it, so it
+// keeps the plain key and costs no read.
+const otherAgentInput =
+  (typeof codex.agent_id === "string" && codex.agent_id.trim().length > 0) ||
+  otherThreadInput(codex.transcript_path, codex.session_id);
+const repeatableDelivery =
+  (target === "record-human-turn" && codex.hook_event_name === "UserPromptSubmit" && !otherAgentInput) ||
+  (target === "continue-workflow" && codex.hook_event_name === "Stop");
+const progress = repeatableDelivery ? assistantMessagesInRollout(codex.transcript_path) : "";
+
 const DEDUPE_ROOT = join(sessionsDir(projectDir), "codex-dedupe");
-const dedupeKey = createHash("sha256").update(`${target}\n${rawInput}`).digest("hex").slice(0, 32);
+const dedupeKey = createHash("sha256").update(`${target}\n${rawInput}${progress}`).digest("hex").slice(0, 32);
 const slotDir = join(DEDUPE_ROOT, dedupeKey);
 const responseFile = join(slotDir, "response.json");
 const SLOT_MAX_AGE_MS = 5 * 60 * 1000;
@@ -910,8 +961,7 @@ switch (target) {
     // the main chat. A path in any other form decides nothing.
     if (
       codex.tool_name !== "request_user_input" &&
-      ((typeof codex.agent_id === "string" && codex.agent_id.trim().length > 0) ||
-        otherThreadInput(codex.transcript_path, codex.session_id))
+      otherAgentInput
     ) {
       persistResponse("", 0);
       return 0;

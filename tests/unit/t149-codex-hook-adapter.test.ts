@@ -1432,6 +1432,78 @@ describe("t149 Codex hook adapter (live-captured payload fixtures)", () => {
     }
   });
 
+  // A person who types the same words again while the turn is still closing
+  // lands in the same Codex turn: Codex 0.162.1 sends that UserPromptSubmit,
+  // and the Stop after it, with stdin byte-identical to the first. The agent
+  // has spoken in between; a Codex duplicate that comes with its original finds
+  // no new assistant message in the rollout. The rollout carries what 0.162.1
+  // writes around each message: the user's line and the agent_message event
+  // that repeats the assistant's words.
+  const REPEAT_SESSION = "019eb8c2-aa02-72e1-9ab4-53e67fca5d63";
+  function rolloutWith(dir: string, assistantMessages: string[], beingWritten = ""): string {
+    const path = join(dir, `rollout-2026-10-19T09-57-33-${REPEAT_SESSION}.jsonl`);
+    const lines = [
+      { type: "session_meta", payload: { id: REPEAT_SESSION } },
+      { type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "1" }] } },
+      ...assistantMessages.flatMap((text) => [
+        { type: "event_msg", payload: { type: "agent_message", message: text, role: "assistant" } },
+        { type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text }] } },
+      ]),
+    ].map((entry) => JSON.stringify(entry));
+    writeFileSync(path, `${lines.join("\n")}\n${beingWritten}`, "utf-8");
+    return path;
+  }
+
+  test("9c: the same words typed again after the agent spoke record a second HUMAN_TURN; a duplicate delivery records none", () => {
+    const dir = scratchProject(true);
+    try {
+      const payload = {
+        hook_event_name: "UserPromptSubmit",
+        session_id: REPEAT_SESSION,
+        turn_id: "same-running-turn",
+        cwd: dir,
+        transcript_path: rolloutWith(dir, ["Which deck? 1. Basics 2. Advanced"]),
+        prompt: "1",
+      };
+      expect(runAdapter(dir, "record-human-turn", payload).code).toBe(0);
+      expect(runAdapter(dir, "record-human-turn", payload).code).toBe(0);
+      expect(humanTurnCount(dir)).toBe(1);
+      // The agent's next message still being written does not count yet.
+      rolloutWith(dir, ["Which deck? 1. Basics 2. Advanced"], '{"type":"response_item","payload":{"type":"message","role":"assistant"');
+      expect(runAdapter(dir, "record-human-turn", payload).code).toBe(0);
+      expect(humanTurnCount(dir)).toBe(1);
+      rolloutWith(dir, ["Which deck? 1. Basics 2. Advanced", "How often? 1. Daily 2. Weekly"]);
+      expect(runAdapter(dir, "record-human-turn", payload).code).toBe(0);
+      expect(humanTurnCount(dir)).toBe(2);
+      expect(runAdapter(dir, "record-human-turn", payload).code).toBe(0);
+      expect(humanTurnCount(dir)).toBe(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("9d: a Stop identical to an earlier one runs the stop check again once the agent has spoken, and replays before", () => {
+    const dir = scratchProject(true);
+    try {
+      const capture = join(dir, "repeat-runs.ndjson");
+      writeFileSync(
+        join(dir, ".codex", "hooks", "aidlc-continue-workflow.ts"),
+        standInHook(capture, "aidlc-continue-workflow.ts", { code: 0 }),
+        "utf-8",
+      );
+      const stop = withCwd({ ...FIXTURES.stop, session_id: REPEAT_SESSION, transcript_path: rolloutWith(dir, ["1"]) }, dir);
+      runAdapter(dir, "continue-workflow", stop);
+      runAdapter(dir, "continue-workflow", stop);
+      expect(recordedRuns(capture)).toHaveLength(1);
+      rolloutWith(dir, ["1", "1"]);
+      runAdapter(dir, "continue-workflow", stop);
+      runAdapter(dir, "continue-workflow", stop);
+      expect(recordedRuns(capture)).toHaveLength(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test("10: session-start reconciles an unclosed prior session as inferred SESSION_ENDED (D-4)", () => {
     const dir = scratchProject(false);
     try {
