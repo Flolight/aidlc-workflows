@@ -594,10 +594,11 @@ is recorded once as `CHANGE_ACCEPTED`.
 
 Migration is deliberate: a pre-upgrade workflow with no baseline skips the
 unclaimed check, and a fieldless per-unit receipt retains the #629 global
-policy. A present but `unbindable`, missing, or corrupt modern baseline/unit
-snapshot fails closed under strict; under relaxed or off a missing or corrupt
-stage-entry baseline skips the unclaimed check with one line, and a missing unit
-snapshot keeps the unit's verdict. `AIDLC_SKIP_SOURCE_FRESHNESS=1` bypasses both global and
+policy. A present but `unbindable` or corrupt modern baseline/unit snapshot,
+and a missing unit snapshot, fail closed under strict. A stage-entry baseline
+missing on this machine (a fresh clone) skips the unclaimed check with one line
+under every Guard Policy; under relaxed or off a corrupt one does the same, and a
+missing unit snapshot keeps the unit's verdict. `AIDLC_SKIP_SOURCE_FRESHNESS=1` bypasses both global and
 per-unit checks; missing/invalid-manifest receipts explicitly record
 `Unit Source Binding Bypass: true`, so the switch must be present again at
 completion. In a modern Bolt, finalize also verifies the attested base-to-
@@ -833,7 +834,7 @@ column.
 | `SCOPE_SAVED` | `tools/aidlc-utility.ts` | `scope-save` subcommand - the person kept a piece of work's current plan as a reusable scope |
 | `GUARD_POLICY_SET` | `tools/aidlc-guard-switch.ts`, `tools/aidlc-lib.ts` | The utility applier builds a row for `config-change --guard-policy <strict\|relaxed\|off>` or a changed scope-owned default in `scope-change`; lib's `appendGuardPolicySetRow` (through `governedGuardPolicy`) records an effective memory-layer change observed at a governed checkpoint. Fields: `Old Value`, `New Value`, `Source` (`you`, `scope <name>`, `<layer>.md`). Utility rows use the previously persisted intent value for `Old Value` (raw text if invalid; `strict` if absent), not the memory-effective value; checkpoint rows retain effective old/new values. |
 | `CHANGE_CONTROL_SET` | `Reserved (retired name)` | The name `GUARD_POLICY_SET` replaced. Written by releases before the rename and still read as the same setting history; no shipped emitter writes it. Same fields: `Old Value`, `New Value`, `Source` |
-| `CHANGE_ACCEPTED` | `tools/aidlc-lib.ts` | A governed checkpoint (plan-approval source drift, review-receipt content change, summary-confirmation authorization, construction-unit change to an approved Unit's work with reviews off) accepted an input change under `relaxed` or `off` (for workspace source that moved after a plan was approved, under every policy) and continued. Fields: `Stage`, optional `Unit`, `Checkpoint`, `Changed`, `Recorded`, `Current`, `Details` (the one line the human hears). One row per distinct change; the same values never produce a second row |
+| `CHANGE_ACCEPTED` | `tools/aidlc-lib.ts` | A governed checkpoint (plan-approval source drift, review-receipt content change, summary-confirmation authorization, construction-unit change to an approved Unit's work with reviews off) accepted an input change under `relaxed` or `off` (for workspace source that moved after a plan was approved, and for a stage-entry source record missing on this machine, under every policy) and continued. Fields: `Stage`, optional `Unit`, `Checkpoint`, `Changed`, `Recorded`, `Current`, `Details` (the one line the human hears). One row per distinct change; the same values never produce a second row |
 | `GUARD_RESTORED` | `tools/aidlc-guard-switch.ts` | `config-change --guard.<fence> on` switched a fence back on for this piece of work after a per-work `off` or forced it on above a policy word that lowers it. Fields: `Guard` (the switchable fence), `Scope`, `Source` (`you`). The matching `off` writes `GUARD_DISABLED` |
 | `CEREMONY_SET` | `tools/aidlc-guard-switch.ts` | The shared `config-change` / `scope-change` applier builds changed-setting rows, appended in the same audit batch as the other settings and any scope event. Fields: `Key` (`sensors`, `learnings`, `summary_confirmation`, `plan_approval`, `collaborators`), `Old`, `New`, `Source` (`you` for an explicit set, `scope <name>` for an inherited default); `Old` is the previously saved value (raw text if invalid; scope default if absent), not the environment-effective value. `--intent` / `--space` pin the state and audit shard together. Public `append` / `append-batch` cannot forge the setting row. |
 
