@@ -125,7 +125,14 @@ import {
   stateFilePath,
   worktreesDir,
   writeGuardStoodAside,
+  ActiveDirectiveLockFolderHeldError,
+  activeDirectiveLockHeldAfterStepLine,
+  activeDirectiveLockHeldNote,
+  markPersonLineHeardThisTurn,
+  personLineHeardThisTurn,
+  takeActiveDirectiveReleaseHeld,
 } from "../tools/aidlc-lib.ts";
+import { LOCK_FOLDER_HELD_SAID_KEY } from "../tools/aidlc-lock-line.ts";
 import type { planApprovalAskState } from "../tools/aidlc-plan-approval-ask.ts";
 import { aidlcToolInvocation, quoteCommandArgument } from "../tools/aidlc-runtime-paths.ts";
 import { RECORDABLE_PROJECT_BYPASSES } from "../tools/aidlc-settings.ts";
@@ -2071,6 +2078,53 @@ async function evaluate(
     );
     return 2;
   };
+  // A program holding the project's folders (on Windows, a dev server's file
+  // watcher) keeps the build's start from being recorded. Where the fence
+  // stands aside (off, relaxed, or the person's own switch) the call goes on
+  // with one line a turn and records no pass for a start that was not
+  // published. With the fence up it is refused: a write let through now would
+  // read as drift to the next strict call, which asks for the plan again.
+  const fenceStandsAside = (): boolean => {
+    try {
+      const marker = readActiveDirectiveMarker(projectDir, state ?? "");
+      return codeGenerationPlanApprovalFence(
+        projectDir,
+        { unit: marker?.unit ?? marker?.units?.[0] ?? null },
+        { hookInput: parsed },
+      ).decision === "stand-aside";
+    } catch {
+      return false; // An unreadable fence stays up.
+    }
+  };
+  // Once a turn, whichever of its lines: it stays true until the program stops.
+  const sayLockHeldOnce = (line: string | null): void => {
+    if (line === null) return;
+    const session = typeof parsed?.session_id === "string" ? parsed.session_id : "";
+    if (session && personLineHeardThisTurn(projectDir, session, LOCK_FOLDER_HELD_SAID_KEY)) return;
+    writeGuardStoodAside(line);
+    if (session) markPersonLineHeardThisTurn(projectDir, session, LOCK_FOLDER_HELD_SAID_KEY);
+  };
+  const lockFolderHeld = (error: unknown): number | null => {
+    if (!(error instanceof ActiveDirectiveLockFolderHeldError)) return null;
+    if (!fenceStandsAside()) {
+      if (!error.personLine) return refuseProvenanceFailure(errorMessage(error));
+      recordHookDrop(projectDir, HOOK_NAME, error.message);
+      process.stderr.write(`${oneLine(error.message)}\n`);
+      return 2;
+    }
+    recordHookDrop(projectDir, HOOK_NAME, error.message);
+    sayLockHeldOnce(activeDirectiveLockHeldNote());
+    return 0;
+  };
+  // This call and its record went through, but its own release left the lock
+  // folder held, so the next one meets it. With the fence up it says nothing:
+  // the next write is refused with the line, which is then true. The line is
+  // said only as the call's whole output (one JSON line on Claude Code); where
+  // the call prints more, the next step says it.
+  const sayOwnReleaseHeld = (otherOutput: boolean): void => {
+    if (!takeActiveDirectiveReleaseHeld() || otherOutput || !fenceStandsAside()) return;
+    sayLockHeldOnce(activeDirectiveLockHeldAfterStepLine());
+  };
   // `lead` false: the reason is already a whole refusal that says what cannot happen.
   // `settingNote` false: a question waiting on the person, where the setting is not in play.
   const refuseExecutionIneligible = (reason: string, lead = true, settingNote = true): number => {
@@ -2438,11 +2492,14 @@ async function evaluate(
         }
       }
     } catch (e) {
+      const held = lockFolderHeld(e);
+      if (held !== null) return held;
       // Source that moved after approval never stops the build (it is one
       // notice line) unless it moved while the start was being published, so a
       // start that throws is a provenance failure.
       return refuseProvenanceFailure(errorMessage(e));
     }
+    sayOwnReleaseHeld(!verdict.block && changeNotices.length > 0);
     if (!verdict.block) {
       for (const notice of changeNotices) process.stdout.write(`${notice}\n`);
     }
@@ -2510,15 +2567,20 @@ async function evaluate(
       // approval still needs source provenance before execution. Reuse the
       // locked start transaction even when edited content made the verdict fail.
       // This hook emits its own stand-aside row below, so begin only reports drift.
+      let printed = 0;
       try {
         for (const notice of beginCodeGenerationBatch(
           projectDir, selected.map(({ target }) => target), { recordContinuation: false }, issued,
         )) {
           process.stdout.write(`${notice}\n`);
+          printed++;
         }
       } catch (e) {
+        const held = lockFolderHeld(e);
+        if (held !== null) return held;
         return refuseProvenanceFailure(errorMessage(e));
       }
+      sayOwnReleaseHeld(printed > 0 || guardStandAsideSpeaks(gate));
       // The row is written once the build has started (the start just held and
       // released the same lock), so it never claims a pass that did not happen.
       // It is this fence's account of what it let through, not approval

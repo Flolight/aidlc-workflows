@@ -160,6 +160,7 @@ import {
   SPACE_NAME_REGEX,
   workflowParticipation,
   ActiveDirectiveLockContendedError,
+  ActiveDirectiveLockFolderHeldError,
   advanceContinuationCursor,
   clearSessionIntentSwitch,
   type UnitCheckpoint,
@@ -2463,6 +2464,14 @@ function emit(requested: Directive): void {
       if (e instanceof EngineModeViolationError) throw e;
       if (projectDir) {
         recordHookDrop(projectDir, "active-directive", errorMessage(e));
+      }
+      // A program holding the lock folder is not freed by a retry or by doctor:
+      // the step is to stop it. That comes before showing an open question
+      // unpublished, whose reply would land on the question beneath it (#2047);
+      // once the program stops, the same command asks it with its marker.
+      if (e instanceof ActiveDirectiveLockFolderHeldError && e.personLine) {
+        writePrepared(prepareEmission(errorDirective(e.message)));
+        return;
       }
       if (prepared.marker !== undefined && openQuestionMarkers.has(prepared.marker)) {
         writePrepared(prepared);
@@ -17961,7 +17970,12 @@ function handleContinue(args: string[], projectDir: string | undefined): void {
         );
         break;
       } catch (error) {
-        if (!(error instanceof ActiveDirectiveLockContendedError) || attempt === 3) throw error;
+        // Waiting does not move a folder a program holds.
+        if (
+          !(error instanceof ActiveDirectiveLockContendedError) ||
+          error instanceof ActiveDirectiveLockFolderHeldError ||
+          attempt === 3
+        ) throw error;
         Bun.sleepSync(500);
       }
     }
@@ -18011,7 +18025,9 @@ function handleContinue(args: string[], projectDir: string | undefined): void {
   } catch (error) {
     if (!(error instanceof ActiveDirectiveLockContendedError)) throw error;
     writePrepared(prepareEmission(errorDirective(
-      "The workflow is busy for a moment. Run the same command again.",
+      error instanceof ActiveDirectiveLockFolderHeldError && error.personLine
+        ? error.message
+        : "The workflow is busy for a moment. Run the same command again.",
     )));
   }
 }
