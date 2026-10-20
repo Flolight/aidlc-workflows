@@ -32917,7 +32917,15 @@ export function evaluateGuardRefusal(
     // before that step is done, and an approved stage leaves only a stage-wide
     // reset. The ways on are the Unit's own: finish the step with the review it
     // has, or start the step again for that Unit.
-    const midStep = !reviewBudgetAvailable && input.attempt.reviewCoverage === "current"
+    // A stage this work runs with no review (express, a Review Override of
+    // none) has nothing to review and nothing to wait for: its way on is the
+    // gate, as for a stage whose passes are spent on current work. Only the
+    // budget refusal says so; the log tool sends it after the summary and
+    // every other review check passed, and any other refusal still stands
+    // between the stage and its gate.
+    const runsNoReview = input.code === "REVIEW_BUDGET_EXHAUSTED" && input.attempt.reviewBudget?.limit === 0;
+    const reviewSettled = input.attempt.reviewCoverage === "current" || runsNoReview;
+    const midStep = !reviewBudgetAvailable && reviewSettled
       ? unitStepInProgress(input)
       : null;
     if (midStep !== null) {
@@ -32931,7 +32939,7 @@ export function evaluateGuardRefusal(
       remedies.push(finish, reopenUnitStepRemedy(input.stage, midStep));
     } else if (
       !reviewBudgetAvailable &&
-      input.attempt.reviewCoverage === "current" &&
+      reviewSettled &&
       openForWork
     ) {
       // With Construction checkpoints the Unit's checkpoint is its gate, and
@@ -32945,7 +32953,12 @@ export function evaluateGuardRefusal(
         route: "orchestrate",
         args: ["next", ...(input.projectDir ? ["--project-dir", input.projectDir] : [])],
       }, { harnessDir: harnessDir() });
-      const presentGate = checkpointUnit === null
+      const presentGate = runsNoReview
+        ? checkpointUnit === null
+          ? "This stage runs no review in this work: open its approval gate for the human."
+          : `This stage runs no review in this work: run \`${showCheckpoint}\`, which shows unit ` +
+            `"${checkpointUnit}"'s checkpoint, and ask it.`
+        : checkpointUnit === null
         ? "Present the unresolved review findings at the approval gate for the " +
           "human instead of starting another review pass."
         : `Present the unresolved review findings at unit "${checkpointUnit}"'s checkpoint ` +
