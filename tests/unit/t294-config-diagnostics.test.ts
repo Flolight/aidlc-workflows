@@ -61,6 +61,7 @@ import {
   type ConfigDiagnosticRecords,
   type ProvidersRecord,
 } from "../../core/tools/aidlc-config-diagnostics.ts";
+import { cmdScriptLaunch } from "../../core/tools/aidlc-executable-path.ts";
 import { collectDoctorReport, firingHooksLastFired, kiroDisabledHookChecks } from "../../core/tools/aidlc-utility.ts";
 import * as runtimePaths from "../../core/tools/aidlc-runtime-paths.ts";
 
@@ -881,13 +882,13 @@ describe("t294 runtime diagnostics", () => {
     );
     expect(existsSync(ran)).toBe(false);
     if (windows) {
-      // cmd.exe would expand % in the path, so such a .cmd is not run.
-      const expanding = join(root, "npm%PATH%");
-      const expandingRan = join(root, "expanding-ran");
+      // A folder name with % or ! (an account name can hold them) is taken as written, never expanded.
+      const expanding = join(root, "npm%PATH%!x!");
       mkdirSync(expanding, { recursive: true });
-      writeFileSync(join(expanding, command), script([`type nul > "${expandingRan}"`, "echo 1.0.80"]));
-      expect(probeHarnessCli("copilot", { ...host, interactivePath: expanding }).status).toBe("missing");
-      expect(existsSync(expandingRan)).toBe(false);
+      writeFileSync(join(expanding, command), script(["echo 1.0.81"]));
+      expect(probeHarnessCli("copilot", { ...host, interactivePath: expanding })).toEqual(
+        expect.objectContaining({ status: "found", version: "1.0.81", path: join(expanding, command) }),
+      );
     }
 
     // npm's Windows layout: the extensionless shell script, copilot.cmd and
@@ -897,6 +898,20 @@ describe("t294 runtime diagnostics", () => {
     for (const name of ["copilot", "copilot.cmd", "copilot.ps1"]) writeFileSync(join(npmLayout, name), "");
     expect(resolveExecutableOnPath("copilot", npmLayout, "win32")).toBe(resolve(npmLayout, "copilot.cmd"));
     expect(resolveExecutableOnPath("copilot.cmd", npmLayout, "win32")).toBe(resolve(npmLayout, "copilot.cmd"));
+    // The one cmd.exe rule (config's probes and opencode's plugin): the path
+    // quoted whole, plain words after it; what cmd.exe would expand or read
+    // again is not started.
+    // The path goes through the environment, so cmd.exe never reads it again.
+    expect(cmdScriptLaunch("C:\\npm\\copilot.cmd", ["--version"], "C:\\Windows\\system32\\cmd.exe")).toEqual({
+      file: "C:\\Windows\\system32\\cmd.exe",
+      args: ["/d", "/v:off", "/s", "/c", '""%AIDLC_CMD_SCRIPT%" --version"'],
+      env: { AIDLC_CMD_SCRIPT: "C:\\npm\\copilot.cmd" },
+    });
+    for (const script of ["C:\\Program Files\\npm\\copilot.cmd", "C:\\npm%PATH%\\copilot.cmd", "C:\\npm!x!\\copilot.cmd", "C:\\a&b^(c)\\copilot.cmd"]) {
+      expect(cmdScriptLaunch(script, ["--version"])?.env, script).toEqual({ AIDLC_CMD_SCRIPT: script });
+    }
+    expect(cmdScriptLaunch('C:\\npm"\\copilot.cmd', ["--version"])).toBeNull();
+    for (const arg of ["a b", "a&b", "a|b", "%x%", "^"]) expect(cmdScriptLaunch("C:\\npm\\copilot.cmd", [arg]), arg).toBeNull();
 
     // Windows spelling: any case, backslashes, a trailing separator. The
     // search skips the folder, and a resolver that names it anyway is ignored.
