@@ -1475,7 +1475,8 @@ function prepareEmission(directive: Directive): PreparedEmission {
   // the plan, so the two lines never disagree.
   // The line is about the run-stage being issued, not the directive on disk,
   // so a repeated `next` or a `continue` of its rules says the same line.
-  if (directive.kind === "run-stage" && directive.plan_approval?.status === "approved") {
+  if (directive.kind === "run-stage" && directive.plan_approval?.status === "approved" &&
+    directive.unit_record_step === undefined) {
     const projectDir = emissionProjectDir(directive);
     const unit = directive.unit ?? null;
     const issued = { kind: "run-stage" as const, ...(unit !== null ? { unit } : {}) };
@@ -2327,6 +2328,12 @@ function withParkedReply(directive: Directive): Directive {
 
 function emit(requested: Directive): void {
   const directive = withBuiltPlanReviewRoute(withPlanApprovalRoute(requested));
+  if (directive.kind === "run-stage" && directive.unit_record_step !== undefined &&
+    directive.plan_approval?.status !== "approved") {
+    delete directive.unit_record_step;
+  } else if (directive.kind === "run-stage" && directive.unit_record_step !== undefined) {
+    directive.mode = "inline";
+  }
   // A refusal that offers building the plan anyway keeps when it was first
   // shown, so a reply of the person's after it can be told from one before.
   if (planApprovalOverrideOffers.has(directive) && !isReadOnlyEngineProbe()) {
@@ -11622,6 +11629,10 @@ function nextUncoveredUnit(
   return { unit: uncovered[0], uncovered };
 }
 
+// A Unit's owed step, and whether it is the completion receipt: for Code
+// Generation that is the one record the Plan Approval hook checks.
+interface UnitRecordStep { text: string; receipt: boolean }
+
 // The step a Unit still owes when its work for this stage is on disk: every
 // required file is there, but one of the records that settles the Unit is not.
 // Either the review (never asked for, waiting for its verdict, or asking for
@@ -11646,7 +11657,7 @@ function unitReceiptOnlyStep(
   ledger: UnitLedger,
   stateContent: string | null,
   scope: string,
-): string | null {
+): UnitRecordStep | null {
   if (stateContent === null) return null;
   if (!ledger.inUse || ledger.receipts.has(unit) || ledger.skipped.has(unit)) return null;
   if (kindVacuous(node, unitKind) || ledger.mode === "wave" || ledger.mode === "mixed") return null;
@@ -11674,14 +11685,15 @@ function unitReceiptOnlyStep(
       // with reviews off.
       if (review.unitStale.has(unit) || review.unitStaleProgress.has(unit)) return null;
       if (!unitWorkIsThisAttempts(projectDir, node.slug, unit, stateContent)) return null;
-      return unitReviewStep(projectDir, node, unit, review, stateContent);
+      const text = unitReviewStep(projectDir, node, unit, review, stateContent);
+      return text === null ? null : { text, receipt: false };
     }
   }
   const command = (action: string): string =>
     `\`${renderEngineInvocation({ route: "state", args: ["unit", action, "--stage", node.slug, "--unit", unit] })}\``;
   const steps = own ? command("complete") : `${command("start")}, then ${command("complete")}`;
   const done = reviewClass === "none" ? "written" : "written and reviewed";
-  return `Unit "${unit}"'s ${node.name} work is ${done}, but its completion is not recorded: run ${steps}.`;
+  return { text: `Unit "${unit}"'s ${node.name} work is ${done}, but its completion is not recorded: run ${steps}.`, receipt: true };
 }
 
 // The review file the open request for this stage (or Unit) names, as the log
@@ -11851,12 +11863,22 @@ function unitWorkIsThisAttempts(projectDir: string, slug: string, unit: string, 
 // `next` for a Unit that owes only its completion receipt: that step, then
 // `next` again. A read-only route check (the one `unit start` runs) still sees
 // the Unit's stage, so the named start command matches the engine's route.
-function emitUnitStepOrStage(step: string | null, directive: Directive): void {
+function emitUnitStepOrStage(step: UnitRecordStep | null, directive: Directive): void {
   if (step === null || isReadOnlyEngineProbe()) {
     emit(directive);
     return;
   }
-  emit(printDirective(`${step} Then run \`${aidlcToolInvocation("orchestrate")} next\`.`));
+  if (step.receipt && directive.kind === "run-stage" && directive.stage === "code-generation") {
+    // Keep the routed Unit and its authority on the normal publication path.
+    // A print alone leaves a stale marker in place, so the hook refuses the
+    // very completion next names. Plan Approval routing still runs before this
+    // recovery is delivered; an unapproved plan gets its own applicable step.
+    // A review step is printed: the hook does not check a review request.
+    directive.unit_record_step = `${step.text} Then run \`${aidlcToolInvocation("orchestrate")} next\`.`;
+    emit(directive);
+    return;
+  }
+  emit(printDirective(`${step.text} Then run \`${aidlcToolInvocation("orchestrate")} next\`.`));
 }
 
 // The receipt step for one named Unit of a solo per-unit stage, or null.
@@ -11873,7 +11895,7 @@ function soloUnitReceiptStep(
   return unitReceiptOnlyStep(
     projectDir, node, unit, engineRelativeRecordDir(projectDir), codekbCtxFor(projectDir),
     resolution.unitKinds?.get(unit) ?? null, unitLedgerFor(projectDir, node.slug), stateContent, scope,
-  );
+  )?.text ?? null;
 }
 
 type ActiveWave =
@@ -15959,7 +15981,7 @@ function checkStageCompletionEvidence(
         const step = unitReceiptOnlyStep(
           pd, node, pick.unit, recordPrefix, codekbCtxFor(pd), unitKinds?.get(pick.unit) ?? null,
           ledger, stateContent, scope,
-        );
+        )?.text ?? null;
         if (step !== null) {
           const left = pick.uncovered.filter((unit) => unit !== pick.unit);
           const nextCommand = `\`${aidlcToolInvocation("orchestrate")} next\``;
