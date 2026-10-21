@@ -156,7 +156,7 @@ import {
   REVIEW_EDITED_FIELD,
   dictatedReviewNotice,
   REVIEW_DICTATED_FIELD,
-  noAgentFinishedSinceReview,
+  noReviewerFinishedSinceReview,
   noReviewerNotice,
   REVIEWER_FINISHED_FIELD,
   recordFileTargetOrThrow,
@@ -4457,10 +4457,12 @@ function handleReview(args: string[]): void {
       // the gate tells the person in one line; under relaxed or off the change
       // is accepted and said once here, like every other accepted change. A
       // completion row without the digest is no evidence, and the row carries
-      // nothing. No completion of any agent since the request is evidence only
-      // where noAgentFinishedSinceReview says so (on Claude Code, outside a
-      // worktree, with no background agent sent since): there the row says no
-      // reviewer had finished, said once here, and at the gate under strict.
+      // nothing. No completion of the reviewer since the request (its row,
+      // with the digest for this review file; another agent's row is not it)
+      // is evidence only where noReviewerFinishedSinceReview says so (on Claude
+      // Code, outside a worktree, with no background agent sent since): there
+      // the row says no reviewer had finished, said once here, and at the gate
+      // under strict.
       // The fallback records none of the file, so none of this applies to it.
       if (body !== null && !incompleteFallback && requestBinding.requestId !== null) {
         const events = readAuditShardEvents(pd, intent, space);
@@ -4491,8 +4493,7 @@ function handleReview(args: string[]): void {
             verdictChangeNotices.push(notice);
           }
         }
-        if (request !== undefined && finished === null &&
-          noAgentFinishedSinceReview(pd, events, request.row, selection)) {
+        if (request !== undefined && noReviewerFinishedSinceReview(pd, events, request, selection)) {
           fields[REVIEWER_FINISHED_FIELD] = "no";
           verdictChangeNotices.push(noReviewerNotice(node.name, flags.unit));
         }
