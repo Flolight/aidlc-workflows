@@ -3452,8 +3452,9 @@ function resolveRecordDir(
   projectDir: string,
   intent?: string,
   space?: string,
+  bind?: boolean,
 ): { dir: string | null; space: string } {
-  const selection = resolveWorkflowSelection(projectDir, { space, intent });
+  const selection = resolveWorkflowSelection(projectDir, { space, intent, ...(bind === undefined ? {} : { bind }) });
   return {
     dir:
       selection.intent === null
@@ -7488,6 +7489,7 @@ export interface WorkflowSelectionOptions {
   space?: string;
   intent?: string;
   sessionId?: string;
+  bind?: boolean;
 }
 
 // THE ONE DOOR. Every id a host hands the engine (a hook payload's session_id,
@@ -7701,7 +7703,8 @@ export function resolveWorkflowSelection(
   // session, or identity a hook handed us, is read-only.
   const chat = rawSession
     ? resolveChat(projectDir, rawSession, {
-        bind: named === null && process.env.AIDLC_SESSION_OVERRIDE_SOURCE !== "payload",
+        bind: options.bind !== false && named === null &&
+          process.env.AIDLC_SESSION_OVERRIDE_SOURCE !== "payload",
       })
     : null;
   const sessionId = chat?.chatId ?? null;
@@ -15496,12 +15499,13 @@ export function auditShards(
   intent?: string,
   space?: string,
   unreadableLocations?: string[],
+  bind?: boolean,
 ): string[] {
   const dirs: string[] = [];
   if (intent === undefined && space !== undefined) {
     dirs.push(join(spaceRecordRoot(projectDir, space), "audit"));
   }
-  const resolved = resolveRecordDir(projectDir, intent, space);
+  const resolved = resolveRecordDir(projectDir, intent, space, bind);
   const intentDir =
     resolved.dir === null ? null : join(resolved.dir, "audit");
   if (intentDir !== null && !dirs.includes(intentDir)) dirs.push(intentDir);
@@ -15745,12 +15749,14 @@ export function readAuditShardEvents(
   intent?: string,
   space?: string,
   unreadableShards?: string[],
+  bind?: boolean,
 ): AuditShardEvent[] {
   const shards = auditShards(
     projectDir,
     intent,
     space,
     unreadableShards,
+    bind,
   );
   // A vanished or refused shard is skipped; growth during read is tolerated.
   const texts = readAuditShardTexts(projectDir, shards, unreadableShards);
@@ -15779,7 +15785,7 @@ export function readActiveAuditShardEvents(
   projectDir: string,
   options: { includeNotes?: boolean } = {},
 ): Array<AuditShardEvent | AuditShardNote> {
-  const selection = resolveWorkflowSelection(projectDir);
+  const selection = resolveWorkflowSelection(projectDir, { bind: false });
   if (selection.intent === null) {
     throw new Error("No active workflow is selected. Start a workflow or select an existing intent.");
   }
@@ -15789,7 +15795,7 @@ export function readActiveAuditShardEvents(
   const unreadable: string[] = [];
   const rows: Array<AuditShardEvent | AuditShardNote> = [];
   if (options.includeNotes) {
-    const shards = auditShards(projectDir, selection.intent, selection.space, unreadable);
+    const shards = auditShards(projectDir, selection.intent, selection.space, unreadable, false);
     const texts = readAuditShardTexts(projectDir, shards, unreadable);
     const copied = copiedAuditBlocks(texts, () => knownAuditShardName(projectDir));
     texts.forEach(({ shard, content, shardIndex }, index) => {
@@ -15797,7 +15803,7 @@ export function readActiveAuditShardEvents(
       rows.push(...parseAuditShardNotes(content, shard, shardIndex, copied[index]));
     });
   } else {
-    rows.push(...readAuditShardEvents(projectDir, selection.intent, selection.space, unreadable));
+    rows.push(...readAuditShardEvents(projectDir, selection.intent, selection.space, unreadable, false));
   }
   if (unreadable.length > 0) {
     throw new Error("Cannot read the active intent's audit history: an audit shard or directory is unreadable.");
