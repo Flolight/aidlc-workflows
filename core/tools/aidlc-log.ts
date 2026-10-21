@@ -142,6 +142,7 @@ import {
   sortAttemptEvents,
   UNTRUSTED_AUDIT_NOTICE,
   planApprovalChallengeRelativePath,
+  agentFileText,
   readRegularFileNoFollowOrThrow,
   readStateFile,
   readUnitSourceManifest,
@@ -571,15 +572,15 @@ function readOverrideReasonFile(pd: string, supplied: string): string {
   }
   let text: string;
   try {
-    text = readRegularFileNoFollowOrThrow(
+    text = agentFileText(readRegularFileNoFollowOrThrow(
       recordFileTargetOrThrow(root, relative(root, absolute)),
       "Plan Approval override reason file",
       4 * 1024,
-    ).toString("utf-8");
+    ));
   } catch (e) {
     error(`Cannot read --override-file ${supplied}: ${errorMessage(e)}`);
   }
-  return text.replace(/^\uFEFF/, "").replace(/\r?\n$/, "");
+  return text.replace(/\r?\n$/, "");
 }
 
 function summaryQuestionEvidence(

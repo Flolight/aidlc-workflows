@@ -208,6 +208,7 @@ import {
   constructionCheckpointGaps,
   effectivePlanAction,
   errorMessage,
+  agentFileText,
   readRegularFileNoFollowOrThrow,
   recordFileTargetOrThrow,
   removeRecordFileNoFollow,
@@ -18256,11 +18257,11 @@ function nextArgsWithRequestFile(
   const unread = `AI-DLC could not read the request in ${relativePath}. Send your request again.`;
   let text: string;
   try {
-    text = readRegularFileNoFollowOrThrow(
+    text = agentFileText(readRegularFileNoFollowOrThrow(
       recordFileTargetOrThrow(projectDir, relativePath),
       "The request file",
       REQUEST_TEXT_MAX_BYTES,
-    ).toString("utf-8").replace(/\r?\n$/, "");
+    )).replace(/\r?\n$/, "");
   } catch {
     return unread;
   }
