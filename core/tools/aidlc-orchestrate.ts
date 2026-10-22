@@ -1506,6 +1506,16 @@ function prepareEmission(directive: Directive): PreparedEmission {
       : null;
     if (line !== null) directive.narration = line;
   }
+  // The count follows the stage's own progress line; the gate shown again
+  // keeps saying what the stage produced.
+  if (
+    directive.kind === "run-stage" && directive.stage === "reverse-engineering" && directive.unit === undefined &&
+    directive.gate_only !== true
+  ) {
+    const projectDir = emissionProjectDir(directive);
+    const scope = projectDir ? reverseEngineeringScopeNarration(projectDir) : null;
+    if (scope !== null) directive.narration = directive.narration ? `${directive.narration} ${scope}` : scope;
+  }
   // The plan step is the conductor's own. The stage's dispatched mode would read
   // "hand the draft to the developer" (a Kiro run did, and the guard refused the
   // dispatch before approval), so while the plan is written, revised or repaired
@@ -2840,6 +2850,18 @@ function narrateSpecialistStage(node: GraphStage, scope: string, stateContent: s
 //
 // The placeholder unit (a scope with no unit DAG) is not a real name, so it
 // falls back to the stage alone rather than saying the token out loud.
+export const RE_LARGE_SCOPE_REPOS = 10;
+
+export function reverseEngineeringScopeNarration(projectDir: string): string | null {
+  // The repos the work records, the set Reverse Engineering reads.
+  const repos = intentRepos(projectDir).length;
+  if (repos <= 1) return null;
+  const base = `Reverse Engineering reads ${repos} repositories here.`;
+  return repos >= RE_LARGE_SCOPE_REPOS
+    ? `${base} Analysing all ${repos} may take significant time and consume many tokens: say which repositories matter to narrow the scope, or continue and all ${repos} are analysed.`
+    : base;
+}
+
 function narratePerUnitBeat(directive: RunStageDirective): string | null {
   if (directive.gate !== false) return null;
   const unit = directive.unit;
