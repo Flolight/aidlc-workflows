@@ -214,8 +214,8 @@ export interface CodeGenerationApproval {
   instructionsExist: boolean;
   approved: boolean;
   contractValid: boolean;
-  fingerprintValid: boolean;
-  receiptValid: boolean;
+  fingerprintValid: boolean | null;
+  receiptValid: boolean | null;
   contractHash: string | null;
   approvalFingerprint: string | null;
   directiveEpoch: string | null;
@@ -5061,8 +5061,8 @@ export function evaluateCodeGenerationApproval(
     instructionsExist: false,
     approved: false,
     contractValid: false,
-    fingerprintValid: false,
-    receiptValid: false,
+    fingerprintValid: null,
+    receiptValid: null,
     contractHash: null,
     approvalFingerprint: null,
     directiveEpoch: null,

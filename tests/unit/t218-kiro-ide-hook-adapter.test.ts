@@ -3214,7 +3214,7 @@ describe("t218 Kiro IDE plan-approval enforcement", () => {
           instructionsExist: true,
           contractValid: true,
           approved: false,
-          receiptValid: false,
+          receiptValid: null,
         });
 
         // Exercise populated modern stdin payloads through the real adapter and
@@ -3271,7 +3271,7 @@ describe("t218 Kiro IDE plan-approval enforcement", () => {
         expect(evaluateCodeGenerationApproval(dir, { unit: null })).toMatchObject({
           ok: false,
           approved: false,
-          receiptValid: false,
+          receiptValid: null,
         });
         for (const result of results) {
           expect(result.code, `${toolName}: ${result.command}\n${result.stderr}`).toBe(
