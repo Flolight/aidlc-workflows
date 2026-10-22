@@ -463,6 +463,10 @@ export interface RunStageDirective {
   // Re-present an open approval gate. Body and review are settled; do not rerun
   // the stage or edit its outputs. Team gates retain their unit_gate routing.
   gate_only?: true;
+  // The open gate shown again carries the same count as the reply that opened
+  // it (PrintDirective.revision_cycle and accept_as_is).
+  revision_cycle?: number;
+  accept_as_is?: "offered" | "next-revision";
   /** Exact remaining Unit record commands; the stage body is already written. */
   unit_record_step?: string;
   // Every Unit this per-Unit stage covers was built in the current attempt, so
@@ -819,6 +823,13 @@ export interface PrintDirective {
   // a plan change made during the stage is in it. null = the final in-scope
   // stage. Same meaning as run-stage's next_stage.
   next_stage?: string | null;
+  // On the same gate reply: the person's change requests at this gate since it
+  // was last approved, counted from the audit trail so a park keeps it; absent
+  // when there are none. accept_as_is says when that count opens the third
+  // option: "offered" adds Accept as-is to this question, "next-revision" adds
+  // the note that it comes after one more round of changes.
+  revision_cycle?: number;
+  accept_as_is?: "offered" | "next-revision";
 }
 
 // error — stop with an error (unknown scope, mutually-exclusive flags, init
@@ -983,6 +994,8 @@ const RUN_STAGE_FIELDS = [
   "protocol_modules",
   "swarm_settled",
   "gate_only",
+  "revision_cycle",
+  "accept_as_is",
   "unit_record_step",
   "build_settled",
   "approve_together",
@@ -1020,6 +1033,8 @@ const DISPATCH_SUBAGENT_FIELDS = [
       field !== "protocol_modules" &&
       field !== "swarm_settled" &&
       field !== "gate_only" &&
+      field !== "revision_cycle" &&
+      field !== "accept_as_is" &&
       field !== "unit_record_step" &&
       field !== "build_settled" &&
       field !== "approve_together" &&
@@ -1084,7 +1099,7 @@ const ASK_FIELDS = [
   "new_project_command",
   "choices",
 ] as const;
-const PRINT_FIELDS = ["kind", "message", "next_stage", "document_note"] as const;
+const PRINT_FIELDS = ["kind", "message", "next_stage", "document_note", "revision_cycle", "accept_as_is"] as const;
 const ERROR_FIELDS = ["kind", "message"] as const;
 const DONE_FIELDS = ["kind", "reason", "workflow_continues"] as const;
 const PARKED_FIELDS = ["kind", "reason", "stage"] as const;
@@ -2045,6 +2060,7 @@ export function validateDirective(obj: unknown): ValidationResult {
     case "print":
       checkString(o, "message", kind, errors);
       checkOptionalNullableString(o, "next_stage", kind, errors);
+      checkOptionalRevisionCycle(o, kind, errors);
       break;
     case "error":
       checkString(o, "message", kind, errors);
@@ -2165,6 +2181,7 @@ function checkRunStageShared(
     checkOptionalProtocolModules(o, kind, errors);
     checkOptionalTrue(o, "swarm_settled", kind, errors);
     checkOptionalTrue(o, "gate_only", kind, errors);
+    checkOptionalRevisionCycle(o, kind, errors);
     checkOptionalString(o, "unit_record_step", kind, errors);
     checkOptionalTrue(o, "build_settled", kind, errors);
     checkOptionalApproveTogether(o, kind, errors);
@@ -2882,6 +2899,21 @@ function checkOptionalPositiveInteger(
       `${kind}: ${field} must be a positive integer, got ${describe(v)}`,
     );
   }
+}
+
+// The gate's change-request count and what it opens, on the reply or step
+// that shows the gate.
+function checkOptionalRevisionCycle(
+  o: Record<string, unknown>,
+  kind: DirectiveKind,
+  errors: string[],
+): void {
+  checkOptionalPositiveInteger(o, "revision_cycle", kind, errors);
+  if (!("accept_as_is" in o)) return;
+  if (typeof o.accept_as_is !== "string") {
+    errors.push(`${kind}: accept_as_is must be string, got ${describe(o.accept_as_is)}`);
+  }
+  checkEnum(o, "accept_as_is", ["offered", "next-revision"], kind, errors);
 }
 
 function checkPositiveInteger(
