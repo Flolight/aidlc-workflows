@@ -40926,18 +40926,41 @@ export function planWithChanges(
   return { stages, errors };
 }
 
-// A per-unit stage uses one stage-level artifact set when the approved plan
-// excludes the Unit DAG producer.
+// Whether the work's cursor (its Current Stage) has moved past `slug` in stage
+// order: only a later stage, or "none" once the work walked off its last
+// stage. A record with no cursor, or one naming a stage the graph does not
+// know (a plugin stage switched off, a stale slug), has passed nothing. The
+// cursor is read first: a record with none never needs the compiled graph,
+// which a sensor run from a source checkout does not have.
+export function cursorPastStage(stateContent: string, slug: string): boolean {
+  const current = getField(stateContent, "Current Stage")?.trim() ?? "";
+  if (current === "") return false;
+  const graph = loadStageGraph();
+  const at = graph.findIndex((stage) => stage.slug === slug);
+  if (at < 0) return false;
+  if (current === "none") return true;
+  const now = graph.findIndex((stage) => stage.slug === current);
+  return now >= 0 && now > at;
+}
+
+// A per-unit stage runs per Unit only once Units exist, and otherwise uses one
+// stage-level artifact set: when the plan skips Units Generation, and when the
+// work's cursor is already past a Units Generation that never ran (a switch
+// into a scope that runs it, or a jump over it), since nothing makes Units
+// until the person goes back to it.
 export function usesStageLevelPerUnitArtifacts(
   scope: string | null | undefined,
   stateContent: string | null,
 ): boolean {
-  if (effectivePlanAction("units-generation", scope, stateContent) === "EXECUTE") return false;
+  const box = stateContent === null
+    ? undefined
+    : parseCheckboxes(stateContent).find((c) => c.slug === "units-generation")?.state;
   // Units Generation that already ran keeps its Units when a later scope
   // change or recompose drops the stage: the Unit work carries on per Unit
   // (#1401), rather than switching to stage-level paths no Unit gate reads.
-  return !(stateContent !== null &&
-    parseCheckboxes(stateContent).some((c) => c.slug === "units-generation" && c.state === "completed"));
+  if (box === "completed") return false;
+  if (effectivePlanAction("units-generation", scope, stateContent) !== "EXECUTE") return true;
+  return stateContent !== null && box !== undefined && cursorPastStage(stateContent, "units-generation");
 }
 
 // Parse each stage's EXECUTE or SKIP suffix from Stage Progress. The suffix is
