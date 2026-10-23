@@ -1175,6 +1175,12 @@ async function createV1Adapter({
 //   event session.execution.succeeded          → event session.idle
 //   event session.execution.interrupted        → event session.error (aborted)
 //   event permission.replied                   → event permission.replied
+//   shell.hook("create.before")                → shell.env
+//
+// V2's shell event carries the command's env but no session, so the shell
+// tool's execute.before (which names the session and fires first) records it
+// per command, and create.before consumes it. A command typed in opencode's
+// own terminal has no tool call ahead of it and names no chat, as on V1.
 //
 // V2 renames built-in tools (shell, subagent, patch); toV1Tool maps them back
 // so the hook map keeps one vocabulary. The nudge is sent with
@@ -1204,6 +1210,10 @@ export type V2PluginContext = {
     hook(name: string, callback: V2HookCallback): Promise<unknown>;
   };
   tool: {
+    hook(name: string, callback: V2HookCallback): Promise<unknown>;
+  };
+  /** Absent on hosts older than the shell domain; the override is then skipped. */
+  shell?: {
     hook(name: string, callback: V2HookCallback): Promise<unknown>;
   };
   event: {
@@ -1262,6 +1272,20 @@ async function setupV2(
       },
     },
   };
+  // Sessions of shell tool calls waiting for their shell, oldest first per command.
+  const pendingShells = new Map<string, Array<{ callID: string; sessionID: string }>>();
+  const takePendingShell = (command: string): string | undefined => {
+    const queue = pendingShells.get(command);
+    const entry = queue?.shift();
+    if (queue && queue.length === 0) pendingShells.delete(command);
+    return entry?.sessionID;
+  };
+  const dropPendingShell = (command: string, callID: string): void => {
+    const queue = pendingShells.get(command);
+    const at = queue?.findIndex((e) => e.callID === callID) ?? -1;
+    if (queue && at >= 0) queue.splice(at, 1);
+    if (queue && queue.length === 0) pendingShells.delete(command);
+  };
   const hooks: V1Hooks = await createV1Adapter({
     client,
     directory: ctx.location.directory,
@@ -1291,6 +1315,12 @@ async function setupV2(
       output,
     );
     if (output.args !== event.input) event.input = output.args;
+    const command = output.args?.command;
+    if (event.tool === "shell" && typeof command === "string") {
+      const queue = pendingShells.get(command) ?? [];
+      queue.push({ callID: event.id, sessionID: event.sessionID });
+      pendingShells.set(command, queue);
+    }
   });
 
   await ctx.tool.hook("execute.after", async (event: {
@@ -1302,12 +1332,26 @@ async function setupV2(
     result?: unknown;
   }) => {
     const tool = toV1Tool(event.tool);
+    // A shell call that never reached a shell must not name the next one.
+    if (event.tool === "shell" && typeof event.input?.command === "string") {
+      dropPendingShell(event.input.command, event.id);
+    }
     // A failed write changed nothing to audit; a failed subagent still ended.
     if (event.status !== "completed" && tool !== "task") return;
     await hooks["tool.execute.after"](
       { tool, sessionID: event.sessionID, callID: event.id, args: event.input ?? {} },
       { output: v2ToolOutput(event.result) },
     );
+  });
+
+  await ctx.shell?.hook("create.before", async (event: {
+    command: string;
+    cwd: string;
+    env: Record<string, string>;
+  }) => {
+    const sessionID = takePendingShell(event.command);
+    if (!sessionID || !event.env) return;
+    await hooks["shell.env"]({ cwd: event.cwd, sessionID }, { env: event.env });
   });
 
   await ctx.session.hook("compaction", async (event: { sessionID: string }) => {

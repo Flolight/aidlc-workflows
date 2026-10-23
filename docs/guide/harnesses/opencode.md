@@ -226,6 +226,7 @@ V2's plugin API (live-verified on 2.0.24):
 | `session.hook("compaction")` | state validation before compaction |
 | `session.execution.succeeded` event | the Stop hook and its nudge (`session.idle`) |
 | `session.execution.interrupted`, `permission.replied` events | no nudge after Esc or a rejected command |
+| `shell.hook("create.before")` | each shell command acts on its own chat's work (`shell.env`) |
 
 V2 renames the built-in tools (`bash` → `shell`, `task` → `subagent`,
 `apply_patch` → `patch`); the adapter maps them back. Its tool events name the
@@ -233,6 +234,11 @@ calling agent, so reviewer identity comes from the event itself. The nudge is
 sent as a synthetic message, which V2 never passes to the prompt hook, so it
 can never count as a human turn. Subagent prompts do reach the prompt hook;
 the adapter recognises child sessions by their parent and skips them.
+
+OpenCode 2's shell event carries the command's environment but no session, so
+the adapter takes the session from the shell tool call that precedes it. A
+command typed in opencode's own terminal has no such call and names no chat,
+as on opencode 1.
 
 The shipped `opencode.json`, agent files and `/aidlc` command keep the
 opencode 1 shapes, which OpenCode 2 reads unchanged. Leave them in that form:

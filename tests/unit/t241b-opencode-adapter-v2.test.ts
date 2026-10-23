@@ -72,6 +72,7 @@ type Callback = (event: unknown) => Promise<void> | void;
 function fakeContext(directory: string, parentBySession: Record<string, string> = {}) {
   const sessionHooks = new Map<string, Callback>();
   const toolHooks = new Map<string, Callback>();
+  const shellHooks = new Map<string, Callback>();
   const synthetic: Array<{ sessionID: string; text: string }> = [];
   const queue: Array<{ type: string; data?: Record<string, unknown> }> = [];
   let wake: (() => void) | null = null;
@@ -92,6 +93,12 @@ function fakeContext(directory: string, parentBySession: Record<string, string> 
     tool: {
       hook: async (name, callback) => {
         toolHooks.set(name, callback as Callback);
+        return {};
+      },
+    },
+    shell: {
+      hook: async (name, callback) => {
+        shellHooks.set(name, callback as Callback);
         return {};
       },
     },
@@ -122,6 +129,12 @@ function fakeContext(directory: string, parentBySession: Record<string, string> 
     before: (event: Record<string, unknown>) => toolHooks.get("execute.before")!(event),
     after: (event: Record<string, unknown>) => toolHooks.get("execute.after")!(event),
     compaction: (sessionID: string) => sessionHooks.get("compaction")!({ sessionID, messages: [] }),
+    /** opencode 2 creating a shell; returns the env the command will run with. */
+    shell: async (command: string, cwd = directory) => {
+      const event = { command, cwd, timeout: 0, shell: "/bin/sh", env: { TERM: "xterm-256color" } as Record<string, string> };
+      await shellHooks.get("create.before")!(event);
+      return event.env;
+    },
     /** Deliver one event and wait until the adapter has handled it. */
     emit: async (type: string, data: Record<string, unknown>) => {
       const target = processed + queue.length + 1;
@@ -180,6 +193,29 @@ describe("t241b OpenCode 2 entry point", () => {
     await v2.emit("session.created", { sessionID: "ses_child2", parentID: "ses_main" });
     await v2.prompt("ses_child2", "You are a subagent spawned by another session.\nRead notes.txt");
     expect(captured(capture)).toHaveLength(0);
+  });
+
+  test("a shell tool call's command runs as its own chat, a helper's as its owner", async () => {
+    // V2's shell event names no session; the shell tool call ahead of it does.
+    const root = freshProject();
+    const v2 = await setup(root, { ses_a_helper: "ses_a" });
+    const owned = { AIDLC_SESSION_OVERRIDE: "ses_a", AIDLC_SESSION_OVERRIDE_SOURCE: "payload" };
+    await v2.before({ tool: "shell", sessionID: "ses_b", agent: "build", id: "call_b", input: { command: "ls" } });
+    await v2.before({ tool: "shell", sessionID: "ses_a_helper", agent: "explore", id: "call_h", input: { command: "ls" } });
+    // Same command from two chats: each shell takes the oldest waiting call.
+    expect(await v2.shell("ls")).toMatchObject({ AIDLC_SESSION_OVERRIDE: "ses_b", AIDLC_SESSION_OVERRIDE_SOURCE: "payload" });
+    expect(await v2.shell("ls")).toMatchObject(owned);
+    expect((await v2.shell("ls")).AIDLC_SESSION_OVERRIDE).toBeUndefined();
+  });
+
+  test("a command typed in opencode's terminal, or a refused call, names no chat", async () => {
+    const root = freshProject();
+    const v2 = await setup(root);
+    expect(await v2.shell("git status")).toEqual({ TERM: "xterm-256color" });
+    // A call that ended without a shell must not name a later terminal command.
+    await v2.before({ tool: "shell", sessionID: "ses_a", agent: "build", id: "call_x", input: { command: "make" } });
+    await v2.after({ tool: "shell", sessionID: "ses_a", id: "call_x", input: { command: "make" }, status: "error" });
+    expect((await v2.shell("make")).AIDLC_SESSION_OVERRIDE).toBeUndefined();
   });
 
   test("V2 tool names reach the V1 checks: a compound shell command is refused", async () => {
