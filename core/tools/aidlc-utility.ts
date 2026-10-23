@@ -238,6 +238,8 @@ import {
   getField,
   hasUnsafeSingleLineCharacter,
   holdsAuditLock,
+  acquireAuditLock,
+  releaseAuditLock,
   hooksHealthReadDir,
   isAutonomousMode,
   isPlainObject,
@@ -736,6 +738,21 @@ function appendAuditEvent(
     appendAuditEntryUnlocked(event, fields, projectDir, intent, space);
   } else {
     appendAuditEntry(event, fields, projectDir, intent, space);
+  }
+}
+
+// Doctor's own receipt rows (DOCTOR_RUN_AUDIT_EVENTS) are not work: a busy lock
+// skips the row after the tight bound the guard rows use, instead of holding
+// doctor for the whole acquire budget. A lock that never frees has its own
+// leaked-lock row in the report. A write failure still throws. The caller
+// passes the append itself, so each row's event stays at its call site, where
+// t48 looks for it.
+function appendDoctorReceipt(projectDir: string, append: () => void): void {
+  if (!acquireAuditLock(projectDir, 5, 50)) return;
+  try {
+    append();
+  } finally {
+    releaseAuditLock(projectDir);
   }
 }
 
@@ -5525,9 +5542,9 @@ export async function collectDoctorReport(
   }
 
   // Leaked-lock probe (P3 reaper surface). Doctor automatically clears only a
-  // provably-dead valid owner or an old genuinely-missing stamp. Live,
-  // malformed, and unreadable owners fail closed and require quiescent manual
-  // recovery.
+  // provably-dead valid owner or an old stamp that never finished. Live
+  // owners, stamps that name no valid owner, and unreadable ones fail closed and
+  // require quiescent manual recovery.
   try {
     const leaks = detectLeakedLocks(projectDir, true);
     if (leaks.length === 0) {
@@ -6940,9 +6957,9 @@ export async function collectDoctorReport(
   // self-creates the audit shard/dir, so an unconditional emit on a pristine
   // project would create a record as a side effect, making --doctor NOT
   // read-only. Doctor runs on a fresh checkout before any workflow is created, so
-  // it must create nothing. On a project with a created intent the emit fires
-  // exactly as before (BARE appendAuditEvent — the only throw is a real write
-  // failure, which the rest of the codebase lets propagate).
+  // it must create nothing. On a project with a created intent the emit goes
+  // through appendDoctorReceipt (a busy lock skips it; a real write failure
+  // still propagates).
   let pairedRuleCount: number | null = null;
   try {
     const pairedRules = loadRules();
@@ -7087,11 +7104,11 @@ export async function collectDoctorReport(
   const auditExists = auditShards(projectDir).length > 0;
 
   if (auditExists && pairedRuleCount !== null) {
-    appendAuditEvent(projectDir, "GUARDRAIL_LOADED", {
+    appendDoctorReceipt(projectDir, () => appendAuditEntryUnlocked("GUARDRAIL_LOADED", {
       Scope: "all",
       Path: `${harnessDir()}/${rulesSubdir()}/`,
       "Rule count": String(pairedRuleCount),
-    });
+    }, projectDir));
   }
 
   let passed = 0;
@@ -7111,10 +7128,10 @@ export async function collectDoctorReport(
   // see auditExists above). A pristine project gets the stdout report and no
   // file side effects; an initialized project records HEALTH_CHECKED as before.
   if (auditExists) {
-    appendAuditEvent(projectDir, "HEALTH_CHECKED", {
+    appendDoctorReceipt(projectDir, () => appendAuditEntryUnlocked("HEALTH_CHECKED", {
       Request: `/aidlc --doctor`,
       Details: `${passed} passed, ${failed} failed`,
-    });
+    }, projectDir));
   }
 
   return { checks: reportResults, passed, warnings, failed, parked_attempts: parkedAttempts };

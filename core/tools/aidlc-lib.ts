@@ -34531,10 +34531,10 @@ export function countCheckboxes(
 //      request key, while each receipt retains the acquisition-bound identity.
 //
 // REAPER: acquire stamps owner PID + acquisition generation + a random token
-// into owner.json. Automatic recovery is fail-closed: malformed/unreadable
-// stamps and live owners are never reaped. A recoverable owner-stamped reap
-// gate blocks acquisition while a provably-dead generation (or an old genuinely
-// missing stamp) is moved, verified, deleted, or restored.
+// into owner.json. Automatic recovery is fail-closed: stamps that name no valid
+// owner, unreadable stamps and live owners are never reaped. A recoverable
+// owner-stamped reap gate blocks acquisition while a provably-dead generation
+// (or an old stamp that never finished) is moved, verified, deleted, or restored.
 
 // The reserved bucket for workspace-level mutations (intents.json, intent creation).
 export const WORKSPACE_LOCK_SENTINEL = "__workspace__";
@@ -34624,7 +34624,11 @@ export interface AuditLockFaultHooksForTests {
   afterSuccessfulReap?: (lockDir: string) => void;
   afterReapFinalCheck?: (lockDir: string) => void;
   failReapRename?: (privatePath: string, attempt: number) => boolean;
-  beforeAcquirerOwnerStamp?: (lockDir: string, token: string) => void;
+  beforeAcquirerOwnerStamp?: (
+    candidateDir: string,
+    canonicalDir: string,
+    token: string,
+  ) => void;
   beforeGateOwnerStamp?: (
     candidateDir: string,
     canonicalDir: string,
@@ -35072,6 +35076,14 @@ function writeOwnerStamp(
   }
 }
 
+// "missing" means no owner ever finished its stamp: no owner.json, an empty one,
+// or one JSON.parse rejects. That is what a process killed between creating the
+// file and writing it leaves (releases before the stamp was written privately
+// stamped the lock in place), so it is judged like an unstamped folder: reaped
+// once older than the grace, under the gate. A live writer is never seen that
+// way: it stamps a private folder renamed into place, while holding the gate
+// the reaper must take. A stamp that parses but names no valid owner is
+// "invalid" and an OS error reading it is "unreadable"; both stay fail-closed.
 function inspectOwnerStamp(lockDir: string): OwnerStampRead {
   let raw: string;
   try {
@@ -35086,7 +35098,7 @@ function inspectOwnerStamp(lockDir: string): OwnerStampRead {
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return { status: "invalid" };
+    return { status: "missing" };
   }
   if (!isPlainObject(parsed) || typeof parsed.pid !== "number" || typeof parsed.startedAtMs !== "number") {
     return { status: "invalid" };
@@ -35167,13 +35179,12 @@ function reapSuffix(): string {
   return `${process.pid}-${_reapCounter}`;
 }
 
-// Grace window (ms) for an UNSTAMPED lock dir. acquireAuditLock mkdirs the lock
-// dir THEN writes owner.json, so there is a brief window where a live holder's
-// dir has no stamp yet. A waiter must NOT steal an unstamped dir younger than
-// this grace (it is a live process mid-acquire) — only an unstamped dir OLDER
-// than the grace is treated as a genuine leak (e.g. a SIGKILL between mkdir and
-// stamp). Generous relative to the mkdir→write gap, tiny relative to the stale
-// threshold. Tunable via AIDLC_LOCK_UNSTAMPED_GRACE_MS.
+// Grace window (ms) before a lock folder whose stamp never finished (see
+// inspectOwnerStamp) counts as a leak. The gate is the real fence: a live
+// writer stamps while holding it, and the reaper must take it first. The grace
+// is the second one, for a folder an older release stamped in place and for
+// any writer outside the gate. Measured from the folder's mtime, which moves
+// when owner.json is created. Tunable via AIDLC_LOCK_UNSTAMPED_GRACE_MS.
 function unstampedGraceMs(): number {
   const raw = process.env.AIDLC_LOCK_UNSTAMPED_GRACE_MS;
   if (raw) {
@@ -35184,7 +35195,7 @@ function unstampedGraceMs(): number {
 }
 
 // The lock dir's own mtime epoch (ms), or null if it can't be stat'd. Used as the
-// age anchor for an UNSTAMPED dir (no owner.json yet / ever). statSync mtime is a
+// age anchor for an UNSTAMPED dir (no finished owner.json). statSync mtime is a
 // wall-clock ms, comparable to lockAcquireEpochMs()'s epoch family.
 function lockDirMtimeMs(lockDir: string): number | null {
   try {
@@ -35282,9 +35293,18 @@ function reapPrivateDir(lockDir: string, claimToken: string): string {
   return `${lockDir}.dead.${claimToken}`;
 }
 
+// The one way an owner-stamped folder (a lock or its coordination gate) is
+// published: built and stamped under a private name, then renamed into place,
+// so it appears with its stamp complete or not at all. A process killed on the
+// way leaves only its private candidate folder, which nothing reads. The caller
+// holds what excludes other publishers (the gate for a lock, the native mutex
+// for a gate), so the name cannot be taken between the check and the rename;
+// the check makes a taken name a lost round on every platform, since POSIX
+// rename replaces an empty directory and Windows refuses any existing one.
 function tryCreateOwnerStampedDir(
   dir: string,
-  reapLiveOwnerAfterStale = true,
+  reapLiveOwnerAfterStale: boolean,
+  kind: "gate" | "lock",
 ): OwnerStampedLockReceipt | null {
   const candidate = `${dir}.candidate.${randomUUID()}`;
   try {
@@ -35296,13 +35316,14 @@ function tryCreateOwnerStampedDir(
   const candidateTokenDir = join(candidate, token);
   try {
     mkdirSync(candidateTokenDir, { mode: 0o700 });
-    AUDIT_LOCK_FAULT_HOOKS_FOR_TESTS?.beforeGateOwnerStamp?.(
-      candidate,
-      dir,
-      token,
-    );
+    if (kind === "gate") {
+      AUDIT_LOCK_FAULT_HOOKS_FOR_TESTS?.beforeGateOwnerStamp?.(candidate, dir, token);
+    } else {
+      AUDIT_LOCK_FAULT_HOOKS_FOR_TESTS?.beforeAcquirerOwnerStamp?.(candidate, dir, token);
+    }
     const owner = writeOwnerStamp(candidate, reapLiveOwnerAfterStale, token);
     if (!owner?.token) throw new Error("owner stamp failed");
+    if (existsSync(dir)) throw new Error("the name is taken");
     renameSync(candidate, dir);
     return {
       lockDir: dir,
@@ -35452,7 +35473,7 @@ function acquireReapClaim(lockDir: string): OwnerStampedLockReceipt | null {
   try {
     if (!retryPendingReapGateRelease(claimDir)) return null;
     for (let attempt = 0; attempt <= 3; attempt++) {
-      const created = tryCreateOwnerStampedDir(claimDir, false);
+      const created = tryCreateOwnerStampedDir(claimDir, false, "gate");
       if (created) return created;
       const inspected = inspectOwnerStamp(claimDir);
       if (inspected.status === "ok") {
@@ -35520,7 +35541,7 @@ function releaseReapClaim(receipt: OwnerStampedLockReceipt): boolean {
 }
 
 // Reclaim only a provably-dead stamped owner, a generation-mismatched reused
-// PID, or a genuinely old missing-stamp directory. The fixed owner-stamped reap
+// PID, or an old folder whose stamp never finished. The fixed owner-stamped reap
 // gate blocks acquisition while canonical ownership is moved or restored.
 function reapStaleLock(lockDir: string, reapUnstamped = true): boolean {
   // A live/ambiguous owner cannot be reaped. Avoid taking and publishing the
@@ -35687,30 +35708,6 @@ function releaseCanonicalOwnerStampedLock(
   }
 }
 
-function abandonUnstampedUnderGate(lockDir: string, token: string): void {
-  // Only a successfully-created token directory proves this process owns the
-  // unstamped generation. The caller holds the coordination gate throughout.
-  if (!existsSync(join(lockDir, token))) return;
-  const retired = `${lockDir}.failed.${randomUUID()}`;
-  let moved = false;
-  for (let attempt = 0; attempt <= 100; attempt++) {
-    try {
-      renameSync(lockDir, retired);
-      moved = true;
-      break;
-    } catch {
-      if (!existsSync(join(lockDir, token))) return;
-      if (attempt < 100) Bun.sleepSync(5);
-    }
-  }
-  if (!moved) return;
-  if (!existsSync(join(retired, token))) {
-    restoreReapPrivate(lockDir, retired);
-    return;
-  }
-  try { rmSync(retired, { recursive: true, force: true }); } catch { /* private debris */ }
-}
-
 function acquireOwnerStampedLock(
   lockDir: string,
   maxRetries: number,
@@ -35735,39 +35732,13 @@ function acquireOwnerStampedLockFor(
 ): OwnerStampedLockAcquisition {
   const create = (): OwnerStampedLockReceipt | null => {
     // Negative fast path only. A missing name still goes through the complete
-    // coordinated create/recovery protocol and its exclusive mkdir.
+    // coordinated create/recovery protocol and its re-check before the rename.
     if (existsSync(lockDir)) return null;
     const gate = acquireReapClaim(lockDir);
     if (!gate) return null;
     try {
-      mkdirSync(lockDir, { mode: 0o700 });
-      const token = randomUUID();
-      const tokenDir = join(lockDir, token);
-      try {
-        mkdirSync(tokenDir, { mode: 0o700 });
-      } catch {
-        abandonUnstampedUnderGate(lockDir, token);
-        return null;
-      }
-      AUDIT_LOCK_FAULT_HOOKS_FOR_TESTS?.beforeAcquirerOwnerStamp?.(
-        lockDir,
-        token,
-      );
-      const owner = writeOwnerStamp(lockDir, reapLiveOwnerAfterStale, token);
-      if (!owner?.token) {
-        abandonUnstampedUnderGate(lockDir, token);
-        return null;
-      }
-      const receipt: OwnerStampedLockReceipt = {
-        lockDir,
-        tokenDir,
-        owner: owner as LockOwner & { token: string },
-        releaseBudgetMs: maxRetries * retryMs,
-      };
-      return receipt;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") return null;
-      return null;
+      const created = tryCreateOwnerStampedDir(lockDir, reapLiveOwnerAfterStale, "lock");
+      return created ? { ...created, releaseBudgetMs: maxRetries * retryMs } : null;
     } finally {
       releaseReapClaim(gate);
     }
@@ -36599,9 +36570,10 @@ export function holdsAuditLock(projectDir: string, intent?: string, space?: stri
 
 // --- Doctor probe: leaked audit locks ----------------------------------------
 //
-// Doctor surfaces provably-dead, old missing-stamp, over-age live, malformed,
-// and unreadable locks. Automatic clear is restricted to dead valid owners and
-// old genuinely-missing stamps; every ambiguous/live case remains fail-closed.
+// Doctor surfaces provably-dead, old never-finished-stamp, over-age live,
+// invalid, and unreadable locks. Automatic clear is restricted to dead valid
+// owners and old stamps that never finished; every ambiguous/live case remains
+// fail-closed.
 // We can't enumerate tmpdir() hashes back to
 // projects, so we probe the buckets THIS project would use: the workspace
 // sentinel bucket + every intent record across every space (the same identities
@@ -36736,8 +36708,7 @@ export function detectLeakedLocks(projectDir: string, clear = false): LeakedLock
     } else if (inspected.status === "unreadable") {
       reason = "unreadable-owner";
     } else if (inspected.status === "missing") {
-      // Unstamped: only a leak if older than the mid-acquire grace window (else
-      // a live process is between mkdir and stamp).
+      // Unstamped (no finished stamp): only a leak once older than the grace.
       const mtime = lockDirMtimeMs(lockDir);
       if (mtime !== null && lockAcquireEpochMs() - mtime > unstampedGraceMs()) {
         reason = "unstamped";
