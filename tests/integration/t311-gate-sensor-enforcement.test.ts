@@ -321,6 +321,7 @@ function authorizeOverride(
   fixture: Fixture,
   options = BLOCKING_SENSOR_OVERRIDE_OPTIONS.join(","),
   includeHumanTurn = true,
+  details: string = BLOCKING_SENSOR_OVERRIDE_CHOICE,
 ): void {
   appendAuditEvent(fixture.project, "DECISION_RECORDED", {
     Stage: "probe",
@@ -330,7 +331,7 @@ function authorizeOverride(
   if (includeHumanTurn) appendAuditEvent(fixture.project, "HUMAN_TURN");
   appendAuditEvent(fixture.project, "QUESTION_ANSWERED", {
     Stage: "probe",
-    Details: BLOCKING_SENSOR_OVERRIDE_CHOICE,
+    Details: details,
   });
 }
 
@@ -598,6 +599,17 @@ describe("t311 gate-bound sensor enforcement", () => {
     const accepted = gate(autonomous, overrideArgs());
     expect(accepted.out).not.toContain("Autonomy Mode is autonomous");
     expect(accepted.status, accepted.out).toBe(0);
+  }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
+
+  test("an answer recorded as an option's number authorizes only that option", () => {
+    const byNumber = setupFixture("blocking");
+    authorizeOverride(byNumber, BLOCKING_SENSOR_OVERRIDE_OPTIONS.join(","), true, "2");
+    const overridden = gate(byNumber, overrideArgs());
+    expect(overridden.status, overridden.out).toBe(0);
+
+    const fixFirst = setupFixture("blocking");
+    authorizeOverride(fixFirst, BLOCKING_SENSOR_OVERRIDE_OPTIONS.join(","), true, "1");
+    expect(gate(fixFirst, overrideArgs()).out).toContain("no fresh authorization receipt");
   }, NATIVE_FIXTURE_SETUP_TIMEOUT_MS);
 
   test("blocking dispatch exits, malformed verdicts, and dispatcher timeouts fail closed", () => {
