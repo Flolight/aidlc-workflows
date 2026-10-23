@@ -3148,6 +3148,8 @@ describe("t265b hook lifecycle", () => {
         `cd ${proj}; aidlc ${next}`,
         `cd ${proj}; aidlc --version`,
         `Set-Location -LiteralPath '${proj}'; aidlc ${next} 2>$null | Select-Object -Last 1`,
+        // A location change moves the reading: the engine run from a subfolder.
+        `cd '${join(proj, "other")}'; aidlc ${next}`,
         // A program that writes nothing is not refused for its spelling: a
         // path or an extension names some other program, and that program is
         // neither the engine nor a write.
@@ -3177,7 +3179,6 @@ describe("t265b hook lifecycle", () => {
         `aidlc ${next} 2> src/inline.ts`,
         "Get-Content (Set-Content src/inline.ts code)",
         "Get-ChildItem | Select-Object @{n='x';e={Remove-Item src/app.ts}}",
-        `cd '${join(proj, "other")}'; aidlc ${next}`,
         // A wrapper is not read as plain PowerShell, so the command is not read whole.
         "env Get-Content aidlc/x.md",
       ]) {
@@ -3208,6 +3209,187 @@ describe("t265b hook lifecycle", () => {
     } finally {
       rmSync(proj, { recursive: true, force: true });
       rmSync(machine, { recursive: true, force: true });
+    }
+  });
+
+  // #2456: while the plan-approval guard is refusing the build, doctor and
+  // status are where the person gets the whole picture of why. An agent's
+  // terminal is often not at the project root - VS Code and the Copilot CLI
+  // keep the folder an earlier command left it in - so the agent writes the
+  // `cd` that gets it there. Those are the spellings the reported run was
+  // refused, as a "mutation-capable shell command", and sent back to `next`;
+  // switching the guard off was the only way it reached a diagnosis.
+  //
+  // This case pins only that the reads run. How that is settled is open:
+  // #2523 argues for fewer guard exceptions rather than one more, and both
+  // an exemption and a simpler guard satisfy what is asserted here.
+  test("#2456: the doctor and status reads run while the plan-approval guard blocks the build", () => {
+    const proj = scratchProject();
+    const machine = mkdtempSync(join(realpathSync.native(tmpdir()), "aidlc-t265-doctor-"));
+    // A folder outside the project: there a bare `aidlc doctor` reads some
+    // other project or none, so the `cd` form is the only one that diagnoses
+    // this one.
+    const elsewhere = mkdtempSync(join(realpathSync.native(tmpdir()), "aidlc-t265-outside-"));
+    try {
+      seedState(proj);
+      seedActiveDirective(proj, "code-generation");
+      seedUnit(proj, null, { plan: true, answer: null });
+      const windows = process.platform === "win32";
+      const launcher = join(machine, "bin", windows ? "aidlc.cmd" : "aidlc");
+      const active = join(machine, "versions", "9.9.9", windows ? "aidlc.exe" : "aidlc");
+      for (const file of [launcher, active]) {
+        mkdirSync(dirname(file), { recursive: true });
+        writeFileSync(file, "fixture\n");
+      }
+      writeFileSync(join(machine, "active-executable"), `${active}\n`);
+      writeFileSync(join(proj, ".claude", "tools", "aidlc-doctor.ts"), "// installed tool\n");
+      const env = { AIDLC_INSTALL_ROOT: machine, AIDLC_BIN_DIR: join(machine, "bin") };
+      const subfolder = join(proj, "other");
+      mkdirSync(subfolder, { recursive: true });
+
+      // The guard is blocking: the build's own write is refused, which is the
+      // state the person needs the diagnosis for.
+      const build = runHook(proj, WRITE(join(proj, "src", "app.ts")), env);
+      expect(build.code).toBe(2);
+      expect(build.stderr).toContain("the plan is not approved yet");
+
+      // Every one of these runs the read in the project, from a terminal that
+      // is somewhere else.
+      const reads = [
+        `cd '${proj}' && aidlc doctor`,
+        `cd '${proj}'; aidlc doctor`,
+        `cd '${proj}' && aidlc --doctor`,
+        `cd '${proj}' && aidlc doctor --verbose`,
+        `cd '${proj}' && bun .claude/tools/aidlc.ts doctor`,
+        `cd '${proj}' && bun .claude/tools/aidlc-doctor.ts doctor`,
+        `cd '${proj}' && aidlc status`,
+      ];
+      // The POSIX reading every harness keeps, and the PowerShell reading an
+      // adapter marks (Copilot in VS Code, Kiro IDE): the same reads, from a
+      // subfolder of the project and from outside it.
+      for (const marked of [false, true]) {
+        for (const terminal of [subfolder, elsewhere]) {
+          for (const command of reads) {
+            const result = runHook(
+              proj,
+              {
+                ...BASH(command),
+                cwd: terminal,
+                ...(marked ? { aidlc_shell: "powershell" } : {}),
+              },
+              env,
+            );
+            expect(
+              result.code,
+              `${marked ? "powershell" : "posix"} in ${terminal}: ${command}\n${result.stderr}`,
+            ).toBe(0);
+          }
+        }
+      }
+
+      // Not the spelling: from the same terminal, the forms that name the
+      // project outright pass today and keep passing.
+      for (const command of [
+        `bun '${join(proj, ".claude", "tools", "aidlc.ts")}' doctor`,
+        `aidlc doctor --project-dir '${proj}'`,
+        `aidlc status --project-dir '${proj}'`,
+      ]) {
+        const result = runHook(proj, { ...BASH(command), cwd: elsewhere }, env);
+        expect(result.code, `${command}\n${result.stderr}`).toBe(0);
+      }
+
+      // Not the folder either: the same reads run with the guard switched off,
+      // which was the reported run's only way to a diagnosis, and once the
+      // person has approved the plan. What refuses them is the block itself.
+      for (const command of reads) {
+        const off = runHook(proj, { ...BASH(command), cwd: elsewhere }, {
+          ...env,
+          AIDLC_DISABLE_PLAN_APPROVAL_GUARD: "1",
+        });
+        expect(off.code, `${command}\n${off.stderr}`).toBe(0);
+      }
+      seedUnit(proj, null, { plan: true, answer: "A. Approve Plan" });
+      for (const command of reads) {
+        const result = runHook(proj, { ...BASH(command), cwd: elsewhere }, env);
+        expect(result.code, `${command}\n${result.stderr}`).toBe(0);
+      }
+    } finally {
+      rmSync(proj, { recursive: true, force: true });
+      rmSync(machine, { recursive: true, force: true });
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
+
+  // The rest of #2456's case: a line that starts with a `cd` is read from the
+  // folder the `cd` moves to, the way the shell runs it, so the build still
+  // waits there. While the plan waits, a write into the project after a `cd` is
+  // refused, from a subfolder and from outside, under both readings, and so is
+  // the completion report; a write outside the project after a `cd` there is
+  // judged as that write is; a `cd` the reader cannot follow keeps the starting
+  // folder's reading. The refusal's way on runs as named and with the `cd` too.
+  test("a line that starts with a cd is read from where the cd leads: a write into the project still waits for the plan", () => {
+    const proj = scratchProject();
+    const outside = mkdtempSync(join(realpathSync.native(tmpdir()), "aidlc-t265-cd-outside-"));
+    try {
+      seedState(proj);
+      mkdirSync(join(proj, "src"), { recursive: true });
+      mkdirSync(join(proj, "other"), { recursive: true });
+      writeFileSync(join(proj, ".claude", "tools", "aidlc-orchestrate.ts"), "// installed tool fixture\n");
+      const statePath = join(proj, RECORD_REL, "aidlc-state.md");
+      const p = shellQuoted(proj);
+      const named = "bun .claude/tools/aidlc-orchestrate.ts next";
+      // VS Code hands a hook `c:\...` where an agent writes `C:\...`.
+      const lowerDrive = (path: string) => path.replace(/^[A-Z](?=:)/, (drive) => drive.toLowerCase());
+      const upperDrive = (path: string) => path.replace(/^[a-z](?=:)/, (drive) => drive.toUpperCase());
+      for (const asked of [false, true]) {
+        seedUnit(proj, null, { plan: true, answer: null });
+        if (asked) {
+          writeActiveDirectiveMarker(proj, {
+            kind: "ask", ask_type: "plan-approval", stage: "code-generation",
+            state_sha256: stateDigest(readFileSync(statePath, "utf-8")),
+          });
+        }
+        for (const marked of [false, true]) {
+          const mark = marked ? { aidlc_shell: "powershell" } : {};
+          for (const terminal of [join(proj, "other"), outside]) {
+            const run = (command: string) => runHook(proj, { ...BASH(command), cwd: terminal, ...mark });
+            const where = `${asked ? "asked" : "written"} ${marked ? "powershell" : "posix"} in ${terminal}`;
+            for (const command of [
+              `cd ${p} && echo x > src/app.ts`,
+              `cd ${p}; echo x > src/app.ts`,
+              `cd ${shellQuoted(join(proj, "src"))} && echo x > app.ts`,
+              `cd ${shellQuoted(outside)} && echo x > ${shellQuoted(join(proj, "src", "app.ts"))}`,
+              `cd ${p} && aidlc engine orchestrate report --stage code-generation --result approved --user-input "Approve"`,
+              `(cd ${p} && echo x > src/app.ts)`,
+              `cd "$P" && echo x > src/app.ts`,
+            ]) {
+              const refused = run(command);
+              expect(refused.code, `${where}: ${command}\n${refused.stderr}`).toBe(2);
+            }
+            if (!asked) expect(run(`cd ${p} && echo x > src/app.ts`).stderr).toContain(`\`${named}\``);
+            for (const command of [
+              // A `>` into a file is not plain PowerShell, so under the mark this
+              // write waits as it does without the `cd`.
+              ...(marked ? [] : [`cd ${shellQuoted(outside)} && echo x > out.txt`]),
+              // Unquoted, a Windows path keeps its backslashes only in PowerShell.
+              ...(marked || process.platform !== "win32" ? [`cd ${proj}; aidlc doctor`] : []),
+              `cd ${p} && ${named}`,
+            ]) {
+              const passed = run(command);
+              expect(passed.code, `${where}: ${command}\n${passed.stderr}`).toBe(0);
+            }
+          }
+          const fromRoot = runHook(proj, { ...BASH(named), cwd: proj, ...mark });
+          expect(fromRoot.code, fromRoot.stderr).toBe(0);
+          const drive = runHook(proj, {
+            ...BASH(`cd ${shellQuoted(upperDrive(join(proj, "other")))}; aidlc doctor`), cwd: lowerDrive(proj), ...mark,
+          });
+          expect(drive.code, drive.stderr).toBe(0);
+        }
+      }
+    } finally {
+      rmSync(proj, { recursive: true, force: true });
+      rmSync(outside, { recursive: true, force: true });
     }
   });
 
