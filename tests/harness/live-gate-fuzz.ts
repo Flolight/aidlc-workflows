@@ -329,6 +329,11 @@ export function firstLine(reply: Reply, tool: LiveTool): string | null {
 
 const said = (line: string, tool: LiveTool) => (tool === "codex" ? line.replace(/^\/aidlc/, "$aidlc") : line);
 
+/** The line that opens the wait's question, for a wait the person's first line opens; else null. The live answers check reads it too. */
+export function openingLine(wait: Question): string | null {
+  return OPENED_BY_FIRST_LINE[wait]?.line ?? null;
+}
+
 function spawnTool(argv: string[], proj: string, env: NodeJS.ProcessEnv, input?: string): { rc: number; stdout: string; out: string } {
   const r = spawnSync(argv[0], argv.slice(1), {
     cwd: proj, encoding: "utf-8", env: { ...env, PWD: proj }, maxBuffer: 64 * 1024 * 1024,
