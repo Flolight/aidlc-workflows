@@ -36,7 +36,7 @@
 // every shipped scope that copies the project at every point the agent hands
 // the turn to the person (the scope run's stand-in, scope-run.ts, on each
 // tool's own hook wiring, scope-hosts.ts). gate-fuzz-run.ts is the long mode
-// and replays a run by its id; tests/integration/t-gate-fuzz.test.ts is the suite's.
+// and replays a run by its id; tests/unit/t-gate-fuzz-<n>.test.ts (tests/harness/text-blind-fuzz.ts) is the suite's.
 
 import { createHash } from "node:crypto";
 import {
@@ -374,7 +374,13 @@ function revisionCount(proj: string): number {
   }
 }
 
-/** Set a fixture's Guard Policy the way its state file carries it (test setup, before anyone acts). */
+/**
+ * Set a fixture's Guard Policy the way a setting the person typed sets it (test setup, before anyone acts): the
+ * engine's own line, and the step the template left open (the code plan's question) kept open over the write, as
+ * `writeSettings` keeps it. The marker is bound to the state's digest, which binds the line's value and source, so a
+ * line rewritten by hand left the question stale and the person's reply to it unkept. A line that already holds the
+ * policy stays as it is, its source label with it.
+ */
 function setPolicy(proj: string, policy: Policy): boolean {
   if (policy === "default") return true;
   let file: string;
@@ -385,10 +391,11 @@ function setPolicy(proj: string, policy: Policy): boolean {
   }
   if (!existsSync(file)) return false;
   const text = readFileSync(file, "utf-8");
-  const field = /^- \*\*(?:Change Control|Guard Policy)\*\*:.*$/m;
-  writeFileSync(file, field.test(text)
-    ? text.replace(field, `- **Guard Policy**: ${policy}`)
-    : text.replace(/(## Runtime State\r?\n)/, `$1- **Guard Policy**: ${policy}\n`), "utf-8");
+  const field = lib().guardPolicyStateField(text);
+  if (field && lib().parseGuardPolicyStateLine(lib().getField(text, field))?.value === policy) return true;
+  const written = lib().setGuardPolicyLine(text, lib().formatGuardPolicy(policy, "you"));
+  writeFileSync(file, written, "utf-8");
+  lib().keepActiveDirectiveOverSettingWrite(proj, text, written);
   return true;
 }
 
@@ -1137,9 +1144,8 @@ export function play(state: State, seed: number, steps: Step[], opts: { twin?: b
   }
   copyTree(state.dir, proj, new Set(), false);
   if (opts.policy && opts.policy !== state.policy) setPolicy(proj, opts.policy);
-  const host = hostFor(state.host, proj, fuzzEnvironment(state.unattended));
-  // The host's own profile clears the variable; an unattended driver sets it on every process it starts.
-  if (state.unattended) host.env.AIDLC_UNATTENDED = "1";
+  // An unattended driver starts the tool with AIDLC_UNATTENDED (the tool's own profile clears it).
+  const host = hostFor(state.host, proj, fuzzEnvironment(state.unattended), { unattended: state.unattended });
   joinChat(host, proj, state.session);
   const first = state.session;
   const chats = [first];
@@ -1411,10 +1417,15 @@ const lastIndex = <T>(list: readonly T[], test: (item: T) => boolean, before: nu
   return -1;
 };
 
-/** The person's reply turns on record (the copy's own and the run's), by the design's rule. */
-function replyTurns(run: Run): Array<{ index: number; chat: string | null; message: string | null }> {
+/**
+ * The person's reply turns on record (the copy's own and the run's), by the design's rule. For presence (I1) a blank
+ * typed message is one: the engine counts an empty prompt as the person's turn, since a host may drop its words.
+ */
+function replyTurns(run: Run, opts: { blankIsPresence?: boolean } = {}): Array<{ index: number; chat: string | null; message: string | null }> {
   const blank = new Set<string>();
-  for (const m of run.messages) if (isBlank(m.text) || (m.words === null && isBareCommand(m.text))) blank.add(m.id);
+  for (const m of run.messages) {
+    if ((isBlank(m.text) && opts.blankIsPresence !== true) || (m.words === null && isBareCommand(m.text))) blank.add(m.id);
+  }
   const ran = new Map(run.turns.map((t) => [t.at, t]));
   return run.rows.filter((row) => row.event === "HUMAN_TURN").filter((row) => {
     if (field(row, "Origin") === "host") return false;
@@ -1497,16 +1508,19 @@ export function checkRun(run: Run): Failure[] {
   const failures: Failure[] = [];
   const { state } = run;
   const turns = replyTurns(run);
+  const present = replyTurns(run, { blankIsPresence: true });
   const rows = run.rows;
   const chatsSpoke = (from: number, to: number) => new Set(turns.filter((t) => t.index > from && t.index < to).map((t) => t.chat));
+  const chatsPresent = (from: number, to: number) => new Set(present.filter((t) => t.index > from && t.index < to).map((t) => t.chat));
   if (run.error) failures.push({ invariant: "RUN", what: "the run could not be played", source: "", step: null, detail: run.error });
   for (const s of run.steps) {
     for (const row of s.rows) {
       if (!DECIDING.has(row.event)) continue;
-      // I1: an unspent reply since the last spending row, in this chat or the one chat that spoke since.
-      const lastSpend = lastIndex(rows, (r) => SPENDING.has(r.event) && r.index !== row.index, row.index);
-      const backing = turns.filter((t) => t.index > lastSpend && t.index < row.index);
-      const spoke = chatsSpoke(lastSpend, row.index);
+      // I1: an unspent reply since the last spending row, in this chat or the one chat that spoke since. The rows one
+      // call writes are one decision (a batch reject writes one GATE_REJECTED per Unit), so the count starts before them.
+      const lastSpend = lastIndex(rows, (r) => SPENDING.has(r.event), s.from);
+      const backing = present.filter((t) => t.index > lastSpend && t.index < row.index);
+      const spoke = chatsPresent(lastSpend, row.index);
       const backed = backing.some((t) => t.chat === s.chat) || (backing.length > 0 && spoke.size === 1);
       if (state.unattended) failures.push({ invariant: "I1", what: `${row.event} under AIDLC_UNATTENDED`, source: "", step: s.i, detail: s.label });
       else if (!backed) failures.push({ invariant: "I1", what: `${row.event} with no unspent reply of the person's`, source: "", step: s.i, detail: `${s.label}; rows since the last spending row: ${rows.slice(lastSpend + 1, row.index).map((r) => r.event).join(", ")}` });
@@ -1518,11 +1532,22 @@ export function checkRun(run: Run): Failure[] {
       else if (message === null) failures.push({ invariant: "I2", what: `${row.event} names a message not of this run`, source: "", step: s.i, detail: id });
       else if (!sent.has(message.text)) {
         const cut = message.cut && [...sent].some((t) => t.startsWith(message.text));
-        failures.push({ invariant: "I2", what: cut ? `the message record cut the words at ${message.text.length} characters` : "the message record is not what was typed", source: "", step: s.i, detail: `${JSON.stringify(clip(message.text, 120))}` });
+        // The store keeps a message to its documented bound and marks the cut (MESSAGE_TEXT_MAX_CHARS); a cut anywhere
+        // else, or unmarked, loses words.
+        if (!(cut && message.text.length === store().MESSAGE_TEXT_MAX_CHARS)) {
+          failures.push({ invariant: "I2", what: cut ? `the message record cut the words at ${message.text.length} characters` : "the message record is not what was typed", source: "", step: s.i, detail: `${JSON.stringify(clip(message.text, 120))}` });
+        }
       }
+      // Since S1 a decision's words are every unspent reply of theirs in this chat, in order, ending with the message
+      // the row names: a remark and the answer are both kept.
+      const chatWords = run.messages.filter((m) => m.session === message?.session).map((m) => m.words ?? m.text);
+      const at = message === null ? -1 : run.messages.filter((m) => m.session === message.session).findIndex((m) => m.id === message.id);
+      // A row's field is one line: the audit writer writes each line break in it as \n (renderAuditBlock).
+      const oneLine = (text: string) => text.replace(/\r\n?|\n|\u2028|\u2029/g, "\\n");
+      const windowOf = (value: string) => at >= 0 && chatWords.slice(0, at + 1).some((_, from) => oneLine(chatWords.slice(from, at + 1).join("\n")) === value);
       for (const name of ["Person Reply", "Feedback"]) {
         const value = field(row, name);
-        if (value !== null && message !== null && value !== (message.words ?? message.text)) {
+        if (value !== null && message !== null && value !== oneLine(message.words ?? message.text) && !windowOf(value)) {
           failures.push({ invariant: "I2", what: `${row.event} ${name} is not the message's words`, source: "", step: s.i, detail: `${JSON.stringify(clip(value, 120))} vs ${JSON.stringify(clip(message.words ?? message.text, 120))}` });
         }
       }
@@ -1565,17 +1590,15 @@ export function checkRun(run: Run): Failure[] {
   if (!run.liveness.ok && run.error === null) {
     failures.push({ invariant: "I6", what: "after the run, a reply and next gave no step", source: locate(run.liveness.out) ?? "", step: null, detail: run.liveness.out });
   }
-  // I2 too: the per-chat record of the person's words keeps them whole.
-  for (const [path, text] of Object.entries(run.files)) {
-    const dropped = /\.aidlc-engine\/gate-words\//.test(path) ? Number(/"dropped":(\d+)/.exec(text)?.[1] ?? 0) : 0;
-    if (dropped > 0) failures.push({ invariant: "I2", what: "the gate-words record dropped some of the person's words", source: "", step: null, detail: `${dropped} dropped in ${path.replace(/[0-9a-f-]{20,}/g, "#")}` });
-  }
-  // I7: one reply backs at most one lifecycle decision.
+  // I7: one reply backs at most one lifecycle decision; the rows one call writes are one. (The words themselves are
+  // the message store's since S1: I2 above reads them there, and the gate-words record's own cap is no loss of them.)
+  const stepOf = (index: number) => run.steps.find((o) => index >= o.from && index < o.from + o.rows.length)?.i ?? index;
   for (let k = 0; k < turns.length; k++) {
     const from = turns[k].index;
     const to = turns[k + 1]?.index ?? Number.POSITIVE_INFINITY;
     const spent = rows.filter((r) => r.index > from && r.index < to && r.index >= run.start && SPENDING.has(r.event) && r.event !== "QUESTION_UNANSWERED");
-    if (spent.length > 1) failures.push({ invariant: "I7", what: `one reply backed ${spent.map((r) => r.event).join(" and ")}`, source: "", step: null, detail: `turn at row ${from}` });
+    const calls = [...new Map(spent.map((r) => [stepOf(r.index), r.event])).values()];
+    if (calls.length > 1) failures.push({ invariant: "I7", what: `one reply backed ${calls.join(" and ")}`, source: "", step: null, detail: `turn at row ${from}` });
   }
   // I9: no engine output to the agent holds the person's words, and none has a `say` field.
   for (const s of run.steps) {
@@ -1586,7 +1609,12 @@ export function checkRun(run: Run): Failure[] {
         // A quote may be cut short, so the first 30 characters are enough to show it.
         const words = t.text.trim().slice(0, 30);
         if (words.length >= 12 && !["label", "label-variant", "engine-string", "digit", "command-bare", "blank"].includes(t.shape) && op.out.includes(words)) {
-          failures.push({ invariant: "I9", what: `the person's words in an engine output (${t.shape})`, source: locate(op.out.split(words).join(" ")) ?? "", step: s.i, detail: clip(op.what, 160) });
+          // Where in the step the words sit, when it is a JSON step: the field that hands them to the agent.
+          const path = jsonPathHolding(op.out, words);
+          // The resume re-show hands the agent the replies a stage kept: the one carrier of their words the design
+          // allows in a step (reading-lead, 2026-10-23).
+          if (path === "kept_replies.replies[#]") continue;
+          failures.push({ invariant: "I9", what: `the person's words in an engine output ${path ? `at ${path}` : `(${t.shape})`}`, source: locate(op.out.split(words).join(" ")) ?? "", step: s.i, detail: clip(op.what, 160) });
           break;
         }
       }
@@ -1603,6 +1631,36 @@ export function checkRun(run: Run): Failure[] {
     failures.push({ invariant: "STOP", what, source: locate(s.ops[0].out) ?? "", step: s.i, detail: clip(s.ops[0].out, 300) });
   }
   return failures;
+}
+
+/** The field path (array places as #) of the first string in an output's JSON lines that holds `words`; null if none. */
+function jsonPathHolding(out: string, words: string): string | null {
+  const walk = (value: unknown, path: string): string | null => {
+    if (typeof value === "string") return value.includes(words) ? path : null;
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        const hit = walk(entry, `${path}[#]`);
+        if (hit) return hit;
+      }
+      return null;
+    }
+    if (value !== null && typeof value === "object") {
+      for (const [key, entry] of Object.entries(value)) {
+        const hit = walk(entry, path ? `${path}.${key}` : key);
+        if (hit) return hit;
+      }
+    }
+    return null;
+  };
+  for (const line of out.split("\n")) {
+    try {
+      const hit = walk(JSON.parse(line), "");
+      if (hit) return hit;
+    } catch {
+      // Not a JSON line.
+    }
+  }
+  return null;
 }
 
 /** Whether the state's own step is still open at step `at`: nothing the person decided has landed and the work is not parked. */
@@ -1644,7 +1702,7 @@ function withoutWords(text: string): string {
   return text.replace(/"(text|words|reply|said|feedback|person_reply|personReply|personWords|person_words)"\s*:\s*"(?:[^"\\]|\\.)*"/g, '"$1":"<W>"');
 }
 /** Fields that copy the person's words, and the ones a run mints for itself. */
-const WORD_FIELDS = new Set(["Person Reply", "Feedback", "Details", "Message Id", "Timestamp", "Reply", "Words", "Person Words", "Picked"]);
+const WORD_FIELDS = new Set(["Person Reply", "Feedback", "Reason", "Details", "Message Id", "Timestamp", "Reply", "Words", "Person Words", "Picked"]);
 
 /** What the record holds, by place, with the word-copying fields and the minted ids taken out. */
 export function recordView(run: Run): Map<string, string> {
