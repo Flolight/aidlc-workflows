@@ -961,7 +961,8 @@ export class AgentStandIn {
     while (true) {
       if (this.until?.(d)) return d;
       if (++this.steps > 600) this.fail("over 600 directives without done", d);
-      const key = `${String(d.kind)} ${String(d.stage ?? d.ask_type ?? "")} ${String(d.unit ?? "")} ${JSON.stringify(d.construction_checkpoint ?? d.plan_approval ?? d.gate ?? "")}`;
+      // A Unit's question step before the wave is a step of its own, not the Unit's build.
+      const key = `${String(d.kind)} ${String(d.stage ?? d.ask_type ?? "")} ${String(d.unit ?? "")} ${JSON.stringify(d.construction_checkpoint ?? d.plan_approval ?? d.gate ?? "")}${d.questions_only === true ? " questions" : ""}`;
       const times = (seen.get(key) ?? 0) + 1;
       seen.set(key, times);
       if (times > 3) {
@@ -1163,6 +1164,12 @@ export class AgentStandIn {
     const listed = produces.find((p) => p.endsWith(`${stage}-questions.md`));
     const summaryStage = sourceStage(stage)?.summaryConfirmation === true;
     const questions = listed ?? (summaryStage && produces[0] ? `${dirname(produces[0])}/${stage}-questions.md` : undefined);
+    if (d.questions_only === true) {
+      // A Unit's questions before the stage's wave builds it: asked here; the
+      // wave writes its documents.
+      if (questions) this.askQuestions(d, questions);
+      return;
+    }
     const work = () => {
       if (stage === "code-generation") this.writeCode(d);
       for (const p of produces) {

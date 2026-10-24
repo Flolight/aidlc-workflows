@@ -2762,11 +2762,20 @@ function handleUnit(args: string[]): void {
     const routed = action === "complete"
       ? {}
       : readEngineUnitDirective(pd, slug, unit, action);
+    // A Unit's questions before the wave are the wave's own step.
     if (
       routed.kind === "run-stage" &&
       routed.stage === slug &&
-      routed.wave
+      (routed.wave || routed.questions_only === true)
     ) {
+      if (!routed.wave) {
+        throw new UnitWaveRouteRefusalError(
+          `Refusing unit ${action} for "${unit}" of "${slug}": this step asks ` +
+            `${typeof routed.unit === "string" ? routed.unit : unit}'s questions before the stage's wave builds it, ` +
+            "and a serial Unit receipt here would drop that wave. Ask them, then run " +
+            `\`${aidlcToolInvocation("orchestrate")} next\`.`,
+        );
+      }
       throw new UnitWaveRouteRefusalError(
         `Refusing unit ${action} for "${unit}" of "${slug}": a wave is active for this stage ` +
           "(the orchestration engine currently routes it as a batch). " +
@@ -3041,6 +3050,7 @@ interface EngineUnitDirective {
   stage?: unknown;
   unit?: unknown;
   wave?: unknown;
+  questions_only?: unknown;
 }
 
 function readEngineUnitDirective(
