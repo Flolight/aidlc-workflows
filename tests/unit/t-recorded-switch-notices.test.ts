@@ -1,5 +1,6 @@
 // covers: function:switchesOff, function:switchOffLine, function:switchesOffLines, function:switchOffNotices
-// covers: function:recordSwitchChange, function:clearSwitchCommand
+// covers: function:recordSwitchChange, function:clearSwitchCommand, function:backOnInstruction, function:backOnInstructions
+// covers: hook:aidlc-session-start, function:withAgentNotes
 // covers: function:PERSON_CHECK_SWITCHES, function:PERSON_CHECK_SWITCH_LABELS
 // covers: function:killSwitchSource, function:isKillSwitchSource
 //
@@ -494,6 +495,74 @@ describe("a check switched off for the project is always said, never refused", (
   });
 });
 
+// The person heard the check is off "for this project", so "turn it back on for
+// this project" built into `--project` (the shared file) found nothing to clear,
+// and one chat stopped to ask them again (nightly t-journey-check-off-on.sdk, 4
+// of 4 legs). The agent is handed the one command that turns the check back on
+// from a chat, beside the line it says, and the line stays as it is.
+const BACK_ON = `config flags --clear-bypass ${NAME} --yes`;
+const BACK_ON_RUN = /run exactly this command: (.+? config flags --clear-bypass \S+ --yes), and say what it prints in place of that line\./;
+
+describe("turning a check back on from the chat: the agent is handed the command, the person keeps their line", () => {
+  test("a new chat: the command follows the lines, and run from the chat it turns the check back on", () => {
+    const proj = installedProject();
+    says(proj, ASKED);
+    expect(flagsAsked(proj, "--bypass", NAME, "--local", "--yes").status).toBe(0);
+    const context = sessionStart(proj);
+    const block = context.slice(context.indexOf("CHECKS SWITCHED OFF")).split("\n");
+    expect(block[0]).toContain('say each "- " line to the user once, word for word');
+    // A chat that opens with the request has made the line untrue (live: 3 of
+    // 3 read it out after the check was on again, until the header said so).
+    expect(block[0]).toContain("unless that reply turns its check back on: then say what the command printed instead.");
+    // The lines it says are the "- " lines right under the header; the
+    // instruction is the line after them.
+    const said = block.slice(1, block.findIndex((line, at) => at > 0 && !line.startsWith("- ")));
+    expect(said).toHaveLength(1);
+    expect(said[0]).toStartWith(`- ${OFF}`);
+    expect(said[0]).toContain(FROM_CHAT);
+    expect(said[0]).toEndWith(OFFER);
+    expect(said[0]).not.toContain("--clear-bypass");
+    const instruction = block[1 + said.length];
+    expect(instruction, context).toStartWith("If the person wants the review freeze check back on for this project");
+    expect(instruction).not.toMatch(/ --(?:project|local|global)\b(?!-dir)/);
+    const command = BACK_ON_RUN.exec(instruction)?.[1] ?? "";
+    expect(command).toEndWith(BACK_ON);
+
+    const back = flags(proj, ...command.slice(command.indexOf(" config flags ") + " config flags ".length).split(" "));
+    expect(back.status, back.stdout + back.stderr).toBe(0);
+    expect(back.stdout).toContain("The review freeze check is on again for this project.");
+    expect(resolveProjectFlag(NAME, NONE, proj)).toBeUndefined();
+    expect(sessionStart(proj)).not.toContain("CHECKS SWITCHED OFF");
+  });
+
+  test("kept off by the project's shared file: the line offers nothing, so no command is handed", () => {
+    const proj = installedProject();
+    expect(flags(proj, "--bypass", NAME, "--project", "--yes").status).toBe(0);
+    const context = sessionStart(proj);
+    expect(context).toContain(OFF);
+    expect(context).toContain("Changing that file changes it.");
+    expect(context).not.toContain(OFFER);
+    expect(context).not.toContain("--clear-bypass");
+  });
+
+  test("the engine's next step: the same command rides its note, once, beside the unchanged line", () => {
+    const proj = project();
+    writeLocal(proj, [NAME]);
+    const first = runOrchestrateNext(ORCHESTRATE, proj, [], { cwd: proj, env: quietEnv() });
+    expect(first.status, first.out).toBe(0);
+    const step = first.directive as { change_notices?: string[]; change_notices_note?: string };
+    const line = (step.change_notices ?? []).find((notice) => notice.startsWith(OFF)) ?? "";
+    expect(line, first.out).toEndWith(OFFER);
+    expect(line).not.toContain("--clear-bypass");
+    expect(step.change_notices_note).toStartWith("Say each change_notices line to the person once, word for word");
+    expect(BACK_ON_RUN.exec(step.change_notices_note ?? "")?.[1]).toEndWith(BACK_ON);
+
+    const second = runOrchestrateNext(ORCHESTRATE, proj, [], { cwd: proj, env: quietEnv() });
+    expect(second.status, second.out).toBe(0);
+    expect((second.directive as { change_notices_note?: string }).change_notices_note ?? "").not.toContain("--clear-bypass");
+  });
+});
+
 // The directive and session start are the channels each harness shows: the
 // engine's own output, and the context its session-start adapter returns.
 describe("the line reaches the person on every harness", () => {
@@ -535,6 +604,10 @@ describe("the line reaches the person on every harness", () => {
       expect(started.status, started.stderr).toBe(0);
       expect(started.stdout, started.stderr).toContain(OFF);
       expect(started.stdout).not.toContain(NOT_FROM_CHAT);
+      // The way back for a yes, spelled for this harness's own tools.
+      expect(started.stdout).toContain(`${harness.dir}/tools/aidlc.ts ${BACK_ON}`);
+      expect((next.directive as { change_notices_note?: string }).change_notices_note ?? "")
+        .toContain(`${harness.dir}/tools/aidlc.ts ${BACK_ON}`);
     });
   }
 });
