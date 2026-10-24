@@ -332,6 +332,9 @@ export interface RunStageDirective {
   inputs_note?: string;
   // planNote(): plan, revise, repair or build, from plan_approval.status.
   plan_note?: string;
+  // otherWorkNote(): on a stage that builds in the workspace, the files another
+  // open piece of work in this folder claims, to leave as they are.
+  other_work_note?: string;
   // briefNote(): the lines every agent brief carries on a dispatched topology.
   brief_note?: string;
   // ceremonyNote(): the summary confirmation, confirm when on, skip when off.
@@ -1005,6 +1008,7 @@ const RUN_STAGE_FIELDS = [
   "context_note",
   "inputs_note",
   "plan_note",
+  "other_work_note",
   "brief_note",
   "ceremony_note",
   "unit_gate",
@@ -1356,6 +1360,7 @@ export function reviewRequestNote(
   reviewFile: string,
   recordVerdict: string,
   dispatchAgent: string | null = null,
+  otherWork?: string,
 ): string {
   // A reviewer copy (Kiro) is dispatched by its own name; the brief and
   // the verdict keep the reviewer's.
@@ -1365,7 +1370,8 @@ export function reviewRequestNote(
       `dispatch ${reviewer} instead and tell the person in one line that this review runs without the reviewer ` +
       `read-scope check) as a subagent, name ${reviewer} as the reviewer in the brief,`;
   return `${dispatch} and have it write ${reviewFile}: that file is the reviewer's, so never ` +
-    `write it yourself and never stand in for it. When its verdict is back, record it with \`${recordVerdict}\`.`;
+    `write it yourself and never stand in for it. When its verdict is back, record it with \`${recordVerdict}\`.` +
+    (otherWork === undefined ? "" : ` Its brief carries this line word for word: ${otherWork}`);
 }
 
 // The step after a stage's verdict is recorded (#2400), as the logger decides
@@ -1528,14 +1534,45 @@ export function planNote(
   }
 }
 
+const OTHER_WORK_PATHS_SHOWN = 20;
+const OTHER_WORKS_SHOWN = 5;
+
+// Another piece of work under way in this same folder (a second chat on its own
+// work) claims these files in its Units' source manifests: this build leaves
+// them as they are, and its review raises nothing about them, unless its own
+// plan changes one.
+export function otherWorkNote(
+  works: ReadonlyArray<{ work: string; record: string; paths: readonly string[] }>,
+  reader: "build" | "review" = "build",
+): string {
+  const listed = works.slice(0, OTHER_WORKS_SHOWN).map(({ work, record, paths }) => {
+    const shown = paths.slice(0, OTHER_WORK_PATHS_SHOWN).map((path) => `\`${path}\``).join(", ");
+    const more = paths.length > OTHER_WORK_PATHS_SHOWN
+      ? `, and ${paths.length - OTHER_WORK_PATHS_SHOWN} more, listed in its Units' source manifests under \`${record}/construction/\``
+      : "";
+    return `${work} (${shown}${more})`;
+  });
+  // The note stays bounded however many pieces of work there are.
+  if (works.length > OTHER_WORKS_SHOWN) {
+    listed.push(`and ${works.length - OTHER_WORKS_SHOWN} more, each listing its files in its Units' source manifests ` +
+      "under its record's `construction/` folder");
+  }
+  return `${works.length === 1 ? "Another piece of work is" : "Other pieces of work are"} under way in this same folder, ` +
+    `and these files are ${works.length === 1 ? "its" : "their"} own: ${listed.join("; ")}. ` +
+    (reader === "build"
+      ? "Leave them as they are unless this work's plan changes one of them."
+      : "They are not this work's to review: raise no finding about one unless this work's plan changes it.");
+}
+
 // A dispatched topology: the lines every agent brief carries, ready to paste,
 // so the agent copies a block instead of reading two fields into prose.
-export function briefNote(ceremony: Record<string, unknown>, modules: readonly string[]): string {
+export function briefNote(ceremony: Record<string, unknown>, modules: readonly string[], otherWork?: string): string {
   const switches = CEREMONY_KEYS
     .filter((key) => typeof ceremony[key] === "string")
     .map((key) => `${CEREMONY_FIELDS[key]}: ${String(ceremony[key])}.`);
   return "Every agent brief for this stage carries these lines word for word: " +
-    `${switches.join(" ")} Protocol modules: ${modules.length > 0 ? modules.join(", ") : "none"}.`;
+    `${switches.join(" ")} Protocol modules: ${modules.length > 0 ? modules.join(", ") : "none"}.` +
+    (otherWork === undefined ? "" : ` ${otherWork}`);
 }
 
 // Both states are said: off left as an absence read as the ask on Kiro CLI,
@@ -1760,7 +1797,9 @@ export function withAgentNotes<T extends object>(
       }
     }
     const dispatched = d.mode === "subagent" || d.mode === "pipeline" || d.mode === "mob" || "wave" in d;
-    if (dispatched && isPlainObject(d.ceremony)) notes.brief_note = briefNote(d.ceremony, modules);
+    if (dispatched && isPlainObject(d.ceremony)) {
+      notes.brief_note = briefNote(d.ceremony, modules, typeof d.other_work_note === "string" ? d.other_work_note : undefined);
+    }
   }
   if (
     d.kind === "run-stage" &&
@@ -1864,6 +1903,7 @@ export function validateDirective(obj: unknown): ValidationResult {
   checkAgentNote(o, "ceremony_note", "stage_file" in o, kind, errors);
   checkAgentNote(o, "inputs_note", Array.isArray(o.consumes_absent) && o.consumes_absent.length > 0, kind, errors);
   checkAgentNote(o, "plan_note", "plan_approval" in o, kind, errors);
+  checkAgentNote(o, "other_work_note", "stage_file" in o, kind, errors);
 
   // Rule 4-6: per-kind required-field presence + type checks, with specific,
   // kind-aware messages.
