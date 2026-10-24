@@ -496,6 +496,7 @@ import {
   withPersonsWordsFirst,
   PERSON_ASKED_SKIP_REASON,
   readUnitSourceManifest,
+  readIntentRegistry,
   unitPlainName,
   unitSkippedItsCode,
   waveEligible,
@@ -10773,13 +10774,13 @@ function routeNext(agentArgs: string[], projectDir: string | undefined): void {
   // 9b — no state and NO explicitly named scope (the resolved scope came from
   // env or the default - never a creation signal on its own). The engine cannot
   // read a position to advance from, and creating one is a mutation (init's
-  // job). Emit a clear error rather than guessing — pure read. The message
-  // names the two explicit moves that DO start a workflow; it must not imply
-  // the user already made one (the pre-hardening wording told a user who had
-  // just typed `/aidlc <scope>` to type exactly that — circular now that a
-  // named scope creates). A bare `next` run for a person whose own `/aidlc` line
-  // carried words never reaches this error: takePersonsOwnLine read that line
-  // in the agent's place at the top of routeNext.
+  // job), so nothing is created - pure read. A bare `next` where no work is in
+  // progress (none created, or only archived) asks the person what to build; a
+  // `--resume`, which claims work that is not here, and work whose state file
+  // is gone get the error naming the two explicit moves that DO start a
+  // workflow. A bare `next` run for a person whose own `/aidlc` line carried
+  // words never reaches here: takePersonsOwnLine read that line in the agent's
+  // place at the top of routeNext.
   if (!stateContent) {
     // A setting typed with no work selected for this chat is the setter's to
     // keep for the piece of work this chat starts next (keepSettingsForNextWork
@@ -10836,6 +10837,20 @@ function routeNext(agentArgs: string[], projectDir: string | undefined): void {
       );
       kept.narration = "Tell me what to build and I'll start it.";
       emit(kept);
+      return;
+    }
+    // A bare /aidlc where no work is in progress in this space (none created,
+    // or only archived work) is the normal first step, not an error: the person
+    // is asked what to build, as above. Work whose state file is gone is still
+    // the error, which the Kiro IDE Plan Approval recovery reads as failing
+    // closed.
+    if (!flags.resume && readIntentRegistry(pd, engineSelection(pd).space).every(isArchivedIntent)) {
+      const ask = turnEndingPrint(
+        "Nothing is in progress here yet. Say the line above, then wait: when they say what to build, run that as " +
+          `their request (${entrySkillInvocation()} "<their words>").`,
+      );
+      ask.narration = "Tell me what to build and I'll start it.";
+      emit(ask);
       return;
     }
     emit(errorDirective(
