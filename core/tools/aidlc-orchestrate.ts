@@ -8383,6 +8383,29 @@ function fitPipelineRecord(directive: RunStageDirective): void {
   }
 }
 
+// A wave step hands out as many of its batch's Units as fit beside everything
+// else it carries, in order, and always the first (the step's own Unit): a
+// step too long even for that one gets the size error every step gets. It is
+// cut when the wave is attached, and again here in the transport once the step
+// carries what is added after it is built (the person's kept replies, notices,
+// notes); the route check, which skips the transport, lists the larger set.
+// Measured without the conductor persona, which goes ahead of the step when
+// the two do not fit together.
+function fitWave(directive: RunStageDirective): void {
+  const wave = directive.wave;
+  if (wave === undefined) return;
+  const limit = directiveMaxBytes() - INLINE_RULES_MARGIN_BYTES;
+  const size = (): number => {
+    const { conductor_persona: _sentAhead, ...alone } = directive;
+    return Buffer.byteLength(JSON.stringify(alone), "utf-8");
+  };
+  let kept = wave.entries.length;
+  while (kept > 1 && size() > limit) {
+    kept--;
+    directive.wave = { ...wave, entries: wave.entries.slice(0, kept) };
+  }
+}
+
 // The lead's persona rides in the run-stage itself, never on a rules part. When
 // the step would not fit with it even after its rules and the conductor persona
 // go ahead, the step lists the persona file to read instead, as it did before
@@ -8688,6 +8711,7 @@ function transportRunStage(
   };
   fitPipelineRecord(directive);
   listLeadPersonaUnlessItFits(directive);
+  fitWave(directive);
   const directiveHash = sha256(JSON.stringify(directive));
   const persona = personaSentAhead(directive);
   if (persona !== null) delete directive.conductor_persona;
@@ -12455,42 +12479,21 @@ function attachBoundedWave(
   directive: RunStageDirective,
   wave: RunStageWave,
   codekbCtx: CodekbCtx,
-): string | null {
-  const entries: RunStageWaveEntry[] = [];
-  for (const entry of wave.entries) {
-    const candidate = {
-      batch_index: wave.batch_index,
-      entries: [...entries, entry],
-    };
-    directive.wave = candidate;
-    // Leave room for the final transport's canonical rules_in_context paths
-    // and JSON framing. A large batch degrades to deterministic same-batch
-    // prefixes across successive next calls; it never spills into a dependent
-    // batch merely to fit one directive.
-    if (
-      Buffer.byteLength(JSON.stringify(directive), "utf-8") >
-      directiveMaxBytes() - 1024
-    ) {
-      break;
-    }
-    entries.push(entry);
-  }
-  if (entries.length === 0) {
-    delete directive.wave;
-    return (
-      `Cannot emit the active wave for stage "${directive.stage}" within the ` +
-      `${directiveMaxBytes()}-byte directive limit. Reduce the stage's path/context ` +
-      "fan-out or process this workflow with a smaller unit batch."
-    );
-  }
-  directive.wave = { batch_index: wave.batch_index, entries };
+): void {
+  // A wave step lists the lead's persona as a file, as prepareEmission does
+  // for every step whose body does not run here.
+  listLeadPersona(directive);
+  directive.wave = { batch_index: wave.batch_index, entries: wave.entries };
+  // A large batch degrades to deterministic same-batch prefixes across
+  // successive next calls; it never spills into a dependent batch merely to
+  // fit one directive.
+  fitWave(directive);
   directive.protocol_modules = [...(directive.protocol_modules ?? []), "wave"];
   if (directive.ceremony.learnings === "on") {
-    for (const entry of entries) {
+    for (const entry of directive.wave.entries) {
       bootstrapDirectiveMemory(entry.unit_memory_path, codekbCtx);
     }
   }
-  return null;
 }
 
 // Resolve the first unsettled Bolt-DAG batch from one healed snapshot. A batch
@@ -12846,11 +12849,7 @@ function emitPerUnitRunStage(
       );
       directive.gate = false;
       directive.unit = wave.unit;
-      const waveError = attachBoundedWave(directive, wave.wave, codekbCtx);
-      if (waveError !== null) {
-        emit(errorDirective(waveError));
-        return;
-      }
+      attachBoundedWave(directive, wave.wave, codekbCtx);
       emit(directive);
       return;
     }
@@ -18707,11 +18706,7 @@ function handleContinue(args: string[], projectDir: string | undefined): void {
         codekbCtx,
       );
       if (wave.state === "active" && wave.unit === payload.u) {
-        const waveError = attachBoundedWave(directive, wave.wave, codekbCtx);
-        if (waveError !== null) {
-          emit(errorDirective(waveError));
-          return;
-        }
+        attachBoundedWave(directive, wave.wave, codekbCtx);
       }
     }
   }
