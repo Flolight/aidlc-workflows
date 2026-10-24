@@ -927,6 +927,32 @@ function isPlanWaitSideWrite(projectDir: string, target: string, planPaths: stri
   });
 }
 
+// A path into the project spelled another way than the project is (a Windows
+// 8.3 short name, a linked parent folder, a drive letter substituted for the
+// project folder, which is a drive root), spelled from the project folder, so
+// every check reads it as the project's own. The folder is found by identity
+// and what lies under it stays as written, so a link inside is still seen.
+function inProjectSpelling(projectDir: string, target: string): string {
+  const projectLexical = resolve(projectDir);
+  if (isWithinDir(target, projectLexical)) return target;
+  for (let folder = target; ; folder = dirname(folder)) {
+    if (sameDirectoryIdentity(folder, projectLexical)) return join(projectLexical, relative(folder, target));
+    if (dirname(folder) === folder) return target;
+  }
+}
+
+// A real path with any Windows 8.3 short name expanded: Bun's realpathSync
+// keeps the short name, realpathSync.native expands it. Where native cannot
+// answer (some volumes, such as a RAM disk), the realpathSync answer stands;
+// no test can make native fail.
+function expandedRealPath(path: string): string {
+  try {
+    return realpathSync.native(path);
+  } catch {
+    return realpathSync(path);
+  }
+}
+
 // A write outside the project is never the plan's business: the path as
 // written lies outside the project, and so does the real path of its deepest
 // existing ancestor, so a link from outside into the project counts as inside
@@ -934,7 +960,7 @@ function isPlanWaitSideWrite(projectDir: string, target: string, planPaths: stri
 function isOutsideProject(projectDir: string, target: string): boolean {
   try {
     const projectLexical = resolve(projectDir);
-    const projectReal = realpathSync(projectLexical);
+    const projectReal = expandedRealPath(projectLexical);
     const targetAbs = resolve(target);
     if (isWithinDir(targetAbs, projectLexical) || isWithinDir(targetAbs, projectReal)) return false;
     const suffix: string[] = [];
@@ -945,7 +971,7 @@ function isOutsideProject(projectDir: string, target: string): boolean {
       suffix.unshift(basename(cursor));
       cursor = parent;
     }
-    const real = join(realpathSync(cursor), ...suffix);
+    const real = join(expandedRealPath(cursor), ...suffix);
     return !isWithinDir(real, projectLexical) && !isWithinDir(real, projectReal);
   } catch {
     return false;
@@ -1944,7 +1970,7 @@ async function mutationIntent(
   }
   return {
     targets: targets.map((target) =>
-      isAbsolute(target) ? resolve(target) : resolve(cwd, target)
+      inProjectSpelling(projectDir, isAbsolute(target) ? resolve(target) : resolve(cwd, target))
     ),
     opaqueShell,
     shellCommand,
