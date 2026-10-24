@@ -16666,6 +16666,9 @@ export interface FreshReviewReceipts {
   /** Next request ordinal and recovery availability for stale unit receipts. */
   unitStaleProgress: Map<string, StaleReviewProgress>;
   stageIteration: number | null;
+  /** The stage verdict came from the one bounded stale-receipt recovery pass.
+   *  Read only beside stageVerdict. */
+  stageRecovery?: boolean;
   unitIterations: Map<string, number>;
   stagePending: PendingReviewProgress | null;
   unitPending: Map<string, PendingReviewProgress>;
@@ -22295,6 +22298,7 @@ export function freshReviewReceipts(
     stageStaleProgress,
     unitStaleProgress,
     stageIteration,
+    stageRecovery: stageReceiptRecovery,
     unitIterations,
     stagePending,
     unitPending,
