@@ -41375,6 +41375,77 @@ export function cursorPastStage(stateContent: string, slug: string): boolean {
   return now >= 0 && now > at;
 }
 
+/** Whether `dir` holds a file anywhere under it. */
+export function holdsAnyFile(dir: string): boolean {
+  if (!existsSync(dir)) return false;
+  return readdirSync(dir, { withFileTypes: true })
+    .some((entry) => entry.isDirectory() ? holdsAnyFile(join(dir, entry.name)) : true);
+}
+
+// The stages on the plan that its scope skips and that the work has just
+// passed over: behind the current stage and never started, with nothing after
+// them started but the current stage, which an approval or a jump only just
+// entered (in progress, and nothing of it in the work's record: its own folder,
+// `<phase>/<slug>`, and each Unit's, `<phase>/<unit>/<slug>`, hold no file; the
+// stages before it wrote theirs elsewhere). Reverse Engineering behind the
+// cursor has its own rule (reverseEngineeringOwedBehindCursor).
+function stagesPassedOverJustNow(content: string, workRecordDir: string | null | undefined): string[] {
+  const scope = getField(content, "Scope")?.trim() ?? "";
+  const def = loadScopeMapping()[scope];
+  if (!def || !workRecordDir) return [];
+  const grid: Record<string, "EXECUTE" | "SKIP"> = {};
+  for (const [slug, action] of Object.entries(def.stages)) grid[slug] = action === "EXECUTE" ? "EXECUTE" : "SKIP";
+  const added = planChangesBetween(grid, Object.fromEntries(parseStateStageSuffixes(content))).add
+    .filter((slug) => slug !== "reverse-engineering");
+  if (added.length === 0) return [];
+  const current = getField(content, "Current Stage")?.trim() ?? "";
+  const graph = loadStageGraph();
+  const now = graph.findIndex((stage) => stage.slug === current);
+  const boxes = new Map(parseCheckboxes(content).map((c) => [c.slug, c.state]));
+  if (now < 0 || boxes.get(current) !== "in-progress") return [];
+  const entered = graph[now];
+  const phaseDir = join(workRecordDir, entered.phase);
+  const holdsItsWork = (dir: string): boolean => holdsAnyFile(join(dir, entered.slug));
+  if (holdsItsWork(phaseDir) || (existsSync(phaseDir) && readdirSync(phaseDir, { withFileTypes: true })
+    .some((entry) => entry.isDirectory() && holdsItsWork(join(phaseDir, entry.name))))) return [];
+  return added.filter((slug) => {
+    const at = graph.findIndex((stage) => stage.slug === slug);
+    return at >= 0 && at < now && graph.slice(at).every((stage) =>
+      stage.slug === current || (boxes.get(stage.slug) ?? "pending") === "pending");
+  });
+}
+
+// Whether an add of `slug` puts on the plan a stage the work has just passed
+// over (stagesPassedOverJustNow): recompose takes such an add, and the step
+// that names it carries on into the stage.
+export function addReachesPassedOver(content: string, slug: string, workRecordDir: string | null | undefined): boolean {
+  return stagesPassedOverJustNow(setStageSuffix(content, slug, "EXECUTE"), workRecordDir).includes(slug);
+}
+
+// The stages the person put back on the plan after the work had just passed
+// over them: the ones stagesPassedOverJustNow names whose add the record holds
+// since the current stage started (a RECOMPOSED row naming it, as recompose
+// writes for an add addReachesPassedOver lets through). `next` goes back to
+// the first, as the work would have gone on to it had the add come before the
+// approval, and the jump it names is the engine's own move. A stage on the plan
+// behind the cursor with no such add (a plan whose rows say so from the start)
+// stays as it is.
+export function addedStagesPassedOver(content: string, projectDir: string, intent?: string, space?: string): string[] {
+  const passed = stagesPassedOverJustNow(content, recordDir(projectDir, intent, space));
+  if (passed.length === 0) return [];
+  const current = getField(content, "Current Stage")?.trim() ?? "";
+  const rows = readAuditShardEvents(projectDir, intent, space);
+  const entered = rows
+    .filter((row) => row.event === "STAGE_STARTED" && auditBlockField(row.block, "Stage") === current)
+    .map((row) => row.timestamp)
+    .sort()
+    .at(-1) ?? "";
+  const addedSince = new Set(rows
+    .filter((row) => row.event === "RECOMPOSED" && row.timestamp >= entered)
+    .flatMap((row) => (auditBlockField(row.block, "Stages added") ?? "").split(",").map((slug) => slug.trim())));
+  return passed.filter((slug) => addedSince.has(slug));
+}
+
 // A per-unit stage runs per Unit only once Units exist, and otherwise uses one
 // stage-level artifact set: when the plan skips Units Generation, and when the
 // work's cursor is already past a Units Generation that never ran (a switch
