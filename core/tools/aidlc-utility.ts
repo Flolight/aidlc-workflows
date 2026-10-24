@@ -527,6 +527,7 @@ import {
   discoverProjectHarnesses,
   isCompiledExecutable,
   type ProjectHarness,
+  pinNamedHarness,
   quoteCommandArgument,
   resolveHarnessPath,
   resolveSkillsPath,
@@ -13636,6 +13637,8 @@ export async function main(argv: string[]): Promise<void> {
       handleReclassify(projectDir, flags, rawArgs);
       break;
     case "select-plugins":
+      // The install the person names changes, as `plugin sync` reads it.
+      if (flags["harness-dir"]) pinNamedHarness(projectDir, flags["harness-dir"]);
       handleSelectPlugins(projectDir, positional);
       break;
     case "plugin-list":
