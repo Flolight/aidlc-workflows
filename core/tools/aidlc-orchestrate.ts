@@ -16969,12 +16969,6 @@ function handleResumeReport(
   flags: ReportFlags,
   projectDir: string | undefined,
 ): void {
-  if (flags.stage?.trim()) {
-    emit(errorDirective(
-      "A resume-choice report is not a stage transition; omit --stage.",
-    ));
-    return;
-  }
   // A correction to the agent's command is its next action, never an error
   // that ends the turn.
   if (flags.choice === undefined) {
@@ -17035,6 +17029,22 @@ function emitTypedResumeChoice(
   let choice = flags.choice?.trim().toLowerCase() ?? "";
   const scope = getField(stateContent, "Scope")?.trim() ?? "";
   let named = flags.target;
+  // The --stage of the agent's gate reports, kept on this one with no
+  // --target. A redo reads it as the stage named where the branches below find
+  // the step the work is on; anywhere else it would pick a move, so the agent
+  // names the stage with --target instead.
+  const kept = named === undefined ? flags.stage?.trim() || undefined : undefined;
+  if (choice === "redo" && kept !== undefined) named = kept;
+  const nameTheStage = (): PrintDirective => printDirective(
+    "A re-entry report names the stage the person asked for with `--target <stage>`, not `--stage`. If they named " +
+      "one, run it again with `--target <the stage they named>` and without `--stage`; otherwise run it again " +
+      "without `--stage`.",
+  );
+  // Unit-by-Unit Construction keeps Current Stage on the block's first stage
+  // while the Unit works through later ones: the step it is on is current too.
+  const unitStage = getField(stateContent, "Unit Stage")?.trim();
+  // The step a redo for named Units reopens when they name no stage.
+  const unitsStep = unitStage && nodeForSlug(unitStage) ? unitStage : slug;
   // The Unit step a "redo <stage>" named, kept so the redo is of that exact step.
   let unitStep: string | undefined;
   // The stage a "redo <stage>" named, so a redo for named Units reopens it.
@@ -17046,18 +17056,25 @@ function emitTypedResumeChoice(
     const wanted = named.trim();
     const node = nodeForSlug(wanted);
     const forUnits = flags.unit !== undefined || flags.everyUnit;
-    // Unit-by-Unit Construction keeps Current Stage on the block's first stage
-    // while the Unit works through later ones: the step it is on is current too.
-    const unitStage = getField(stateContent, "Unit Stage")?.trim();
     const walkStep = node !== undefined && isPerUnit(node)
       ? unitWalkStepNamed(pd, scope, stateContent, slug, wanted)
       : null;
     const box = parseCheckboxes(stateContent).find((entry) => entry.slug === wanted)?.state;
     if (!forUnits && walkStep?.past) {
+      if (kept !== undefined) {
+        emit(nameTheStage());
+        return;
+      }
       // A step the Unit in flight already did, the block's first stage
       // included, is reopened for that Unit, as the jump back to it does.
       choice = "jump";
     } else if (wanted === slug) {
+      // For named Units a kept --stage of the block's first stage is not the
+      // step their redo reopens.
+      if (kept !== undefined && forUnits && unitsStep !== slug) {
+        emit(nameTheStage());
+        return;
+      }
       named = undefined;
       redoStage = slug;
     } else if (
@@ -17066,6 +17083,9 @@ function emitTypedResumeChoice(
       named = undefined;
       unitStep = wanted;
       redoStage = wanted;
+    } else if (kept !== undefined) {
+      emit(nameTheStage());
+      return;
     } else if (forUnits && node !== undefined && isPerUnit(node) && (walkStep !== null || box !== "pending")) {
       // A redo for named Units is reopening that step for them, and the reopen
       // judges what each Unit has run: a Unit can finish a step while the
@@ -17133,8 +17153,7 @@ function emitTypedResumeChoice(
     // Redoing a step for named Units is reopening that step for them: the
     // stage the person named, else the step the walk is on, as a jump back to
     // it would.
-    const unitStage = getField(stateContent, "Unit Stage")?.trim();
-    const step = redoStage ?? (unitStage && nodeForSlug(unitStage) ? unitStage : slug);
+    const step = redoStage ?? unitsStep;
     if (nodeForSlug(step) === undefined) {
       emit(errorDirective(
         `This workflow's current stage is not one AI-DLC knows, so it cannot be redone from here. Run \`${entrySkillInvocation()} --status\` to see where it stands.`,
@@ -17176,7 +17195,7 @@ function emitTypedResumeChoice(
   if (choice === "jump") {
     const target = named?.trim() ?? "";
     if (!target) {
-      emit(printDirective(
+      emit(kept !== undefined ? nameTheStage() : printDirective(
         "Ask the person which stage they want, then report again with `--choice jump --target <stage>`.",
       ));
       return;
@@ -17331,7 +17350,7 @@ function handleReport(args: string[], projectDir: string | undefined): void {
     return;
   }
 
-  // A resume ask has no stage and commits no lifecycle outcome. Accept the
+  // A resume ask acts on no stage and commits no lifecycle outcome. Accept the
   // natural verdict used by conductors, then return to next without mutation.
   if (flags.result && RESUME_RESULTS.has(flags.result)) {
     handleResumeReport(flags, projectDir);
