@@ -2185,6 +2185,9 @@ function theirWordsBegin(argv: readonly string[], route: number, verbOnLine = tr
       if (nextFlagTakesFollowing(token, argv[i + 1])) i++;
       continue;
     }
+    // A leading `compose` after the verb is the engine's own, as the
+    // orchestrator's launcher reads it (requestWordsBeginAt).
+    if (named === route + 1 && token === "compose") continue;
     named++;
     if (named > route + (verbOnLine ? 1 : 0)) return i;
   }
