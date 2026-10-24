@@ -228,6 +228,8 @@ export interface CodeGenerationPlanApprovalState {
   /** Plan approval is off: build without asking. `notice` is the one line to show the person first. */
   skipped?: true;
   notice?: string;
+  /** An isolated run's own `next`, which the plan step names in place of the workflow's. */
+  next?: string;
 }
 
 // The engine's Plan Approval question for one target, or for several Units
@@ -250,6 +252,8 @@ export interface PlanApprovalAskContent {
   editing: boolean;
   /** One sentence to say with the question (a repair made, or why nothing was recorded). */
   note?: string;
+  /** An isolated run's own `next`, which the question names after the answer in place of the workflow's. */
+  next?: string;
 }
 
 // run-stage — load the resolved rules, load lead + support agents, load
@@ -1214,11 +1218,11 @@ export const CHANGE_NOTICES_NOTE =
 // A question with one choice is said as its numbered question, since a picker
 // such as Claude Code's takes two options or more. The engine makes that call:
 // a skill sentence that named the case was read aloud to the person.
-export function questionNote(invocation: string, oneChoice = false): string {
+export function questionNote(invocation: string, oneChoice = false, next = `${invocation} next`): string {
   const show = oneChoice ? "say its numbered question to them as given" : "show it to them with its choices as given";
   return `This question is for the person, not for you: ${show}, end your turn, and act only on their reply. ` +
     "When their reply picks one of the choices (its number, its words, or their own words for it), run that " +
-    "choice's command; act on the step it returns, or run `" + invocation + " next` when it returns none. " +
+    "choice's command; act on the step it returns, or run `" + next + "` when it returns none. " +
     "Anything else is their own words: read what they meant.";
 }
 
@@ -1300,11 +1304,12 @@ export const PLAN_CHANGE_DETAILS =
   "(a change they ask for is Request Changes, with what to change after it: --details 'Request Changes: <what they asked>')";
 
 // The plan question's answer is recorded as the person's choice, then the
-// step goes on; with no skill loaded nothing else names that command.
-export function planApprovalQuestionNote(invocation: string, logInvocation: string): string {
-  return `${questionNote(invocation).replace(/\.$/, "")}. When they answer, record the choice they made with ` +
+// step goes on; with no skill loaded nothing else names that command. `next`
+// is an isolated run's own (the question's `plan_approval.next`).
+export function planApprovalQuestionNote(invocation: string, logInvocation: string, next = `${invocation} next`): string {
+  return `${questionNote(invocation, false, next).replace(/\.$/, "")}. When they answer, record the choice they made with ` +
     `\`${logInvocation} answer --stage code-generation --checkpoint plan-approval --details '<their choice>'\` ` +
-    `${PLAN_CHANGE_DETAILS}, then run \`${invocation} next\`.`;
+    `${PLAN_CHANGE_DETAILS}, then run \`${next}\`.`;
 }
 
 export function protocolNote(stageFile: string, modules: readonly string[]): string | null {
@@ -1479,20 +1484,22 @@ export function inputsNote(paths: readonly string[]): string {
 }
 
 // Code Generation: the engine asks for Plan Approval itself (a plan-approval
-// ask), so a stage step only ever says whether to plan or to build.
+// ask), so a stage step only ever says whether to plan or to build. The `next`
+// it names is an isolated run's own when the plan state carries one.
 export function planNote(
-  plan: { status: string; skipped?: true; notice?: string },
+  plan: { status: string; skipped?: true; notice?: string; next?: string },
   invocation: string,
 ): string {
+  const next = plan.next ?? `${invocation} next`;
   switch (plan.status) {
     case "plan":
-      return "Write this plan and its test instructions (Code Generation Steps 1 and 2), then run `" + invocation +
-        " next`: AI-DLC asks the person to approve the plan itself, never you.";
+      return "Write this plan and its test instructions (Code Generation Steps 1 and 2), then run `" + next +
+        "`: AI-DLC asks the person to approve the plan itself, never you.";
     case "revise":
       return "The person asked for changes to this plan: revise the plan and its test instructions from their " +
-        "words, then run `" + invocation + " next`.";
+        "words, then run `" + next + "`.";
     case "repair":
-      return "Fix what the plan's note names, then run `" + invocation + " next`.";
+      return "Fix what the plan's note names, then run `" + next + "`.";
     default:
       return plan.skipped === true
         ? `Say to the person first: ${plan.notice ?? "Plan approval is off for this piece of work."} Then build from ` +
@@ -1684,7 +1691,10 @@ export function withAgentNotes<T extends object>(
     }
     const choices = (notes.choices ?? d.choices) as AskChoice[] | undefined;
     notes.question_note = d.ask_type === "plan-approval"
-      ? planApprovalQuestionNote(invocation, logInvocation)
+      ? planApprovalQuestionNote(
+        invocation, logInvocation,
+        isPlainObject(d.plan_approval) && typeof d.plan_approval.next === "string" ? d.plan_approval.next : undefined,
+      )
       : d.ask_type === "scope-confirm"
       ? planOfferQuestionNote(invocation)
       : d.ask_type === "new-work-routing" && Array.isArray(d.available_intents)
@@ -1723,7 +1733,7 @@ export function withAgentNotes<T extends object>(
         : [];
       if (gaps.length > 0) notes.inputs_note = inputsNote(gaps);
       if (isPlainObject(d.plan_approval) && typeof d.plan_approval.status === "string") {
-        notes.plan_note = planNote(d.plan_approval as { status: string; skipped?: true; notice?: string }, invocation);
+        notes.plan_note = planNote(d.plan_approval as { status: string; skipped?: true; notice?: string; next?: string }, invocation);
       }
     }
     const dispatched = d.mode === "subagent" || d.mode === "pipeline" || d.mode === "mob" || "wave" in d;
@@ -2728,7 +2738,7 @@ function checkOptionalCodeGenerationPlanState(
     return;
   }
   for (const key of Object.keys(value)) {
-    if (!["status", "note", "feedback", "units", "skipped", "notice"].includes(key)) {
+    if (!["status", "note", "feedback", "units", "skipped", "notice", "next"].includes(key)) {
       errors.push(`${kind}: plan_approval unknown key: ${key}`);
     }
   }
@@ -2737,7 +2747,7 @@ function checkOptionalCodeGenerationPlanState(
       `${kind}: plan_approval.status must be one of ${CODE_GENERATION_PLAN_STATUSES.join(" | ")}, got ${describe(value.status)}`,
     );
   }
-  for (const field of ["note", "feedback", "notice"] as const) {
+  for (const field of ["note", "feedback", "notice", "next"] as const) {
     if (field in value && typeof value[field] !== "string") {
       errors.push(`${kind}: plan_approval.${field} must be string, got ${describe(value[field])}`);
     }
@@ -2778,7 +2788,7 @@ function checkPlanApprovalAskContent(
     return;
   }
   for (const key of Object.keys(value)) {
-    if (!["targets", "choices", "editing", "note"].includes(key)) {
+    if (!["targets", "choices", "editing", "note", "next"].includes(key)) {
       errors.push(`${kind}: plan_approval unknown key: ${key}`);
     }
   }
@@ -2811,8 +2821,10 @@ function checkPlanApprovalAskContent(
   if (typeof value.editing !== "boolean") {
     errors.push(`${kind}: plan_approval.editing must be boolean, got ${describe(value.editing)}`);
   }
-  if ("note" in value && typeof value.note !== "string") {
-    errors.push(`${kind}: plan_approval.note must be string, got ${describe(value.note)}`);
+  for (const field of ["note", "next"] as const) {
+    if (field in value && typeof value[field] !== "string") {
+      errors.push(`${kind}: plan_approval.${field} must be string, got ${describe(value[field])}`);
+    }
   }
 }
 

@@ -91,6 +91,7 @@ import {
   replaceTestingContractSection,
   resolveCodeGenerationAuthority,
   resolveTestingPosture,
+  stepNextCommand,
   testingContractDefectMessage,
   usableTestingContract,
   type CodeGenerationIssuance,
@@ -834,8 +835,22 @@ export const planApprovalOverrideOffers = new WeakSet<Directive>();
  * The directive `next` emits in place of a code-generation run-stage or
  * invoke-swarm: the same directive marked plan or build, or the engine's Plan
  * Approval question. Read-only: nothing is written until `publishPlanApprovalAsk`.
+ * An isolated run's plan step and question carry that run's own `next`
+ * (stepNextCommand) for the step to name, since a bare `next` routes the main
+ * workflow; the workflow's carry none.
  */
 export function routeCodeGenerationPlanApproval(projectDir: string, directive: Directive): Directive {
+  const routed = routedPlanApproval(projectDir, directive);
+  if (directive.kind !== "run-stage" || directive.single !== true) return routed;
+  if (routed.kind === "run-stage" && ["plan", "revise", "repair"].includes(routed.plan_approval?.status ?? "")) {
+    (routed.plan_approval as CodeGenerationPlanApprovalState).next = stepNextCommand(projectDir, directive);
+  } else if (routed.kind === "ask" && routed.ask_type === PLAN_APPROVAL_ASK_TYPE) {
+    (routed as PlanApprovalAskDirective).plan_approval.next = stepNextCommand(projectDir, directive);
+  }
+  return routed;
+}
+
+function routedPlanApproval(projectDir: string, directive: Directive): Directive {
   if (!isPlanApprovalBeat(directive)) return directive;
   const units: Array<string | null> = directive.kind === "run-stage"
     ? [directive.unit ?? null]
@@ -853,11 +868,15 @@ export function routeCodeGenerationPlanApproval(projectDir: string, directive: D
     record.targets.every((target) => units.includes(target.unit))
   ) {
     const replied = planApprovalEditingReplyStep(projectDir);
+    // An isolated run's reply goes on with that run's own `next`.
+    const then = directive.kind === "run-stage" && directive.single === true
+      ? `Then run \`${stepNextCommand(projectDir, directive)}\`.`
+      : "Then run next.";
     return planApprovalAskDirective(projectDir, record.targets.map((target) => target.unit), {
       question: record.question,
       editing: true,
       note: record.lastNotice ?? (replied
-        ? `The person replied while editing the files: ${replied}. Then run next.`
+        ? `The person replied while editing the files: ${replied}. ${then}`
         : "The person is editing the files. Wait for them to say done; do not change those files yourself."),
     });
   }
