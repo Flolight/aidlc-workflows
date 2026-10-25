@@ -14,15 +14,28 @@ const WINDOWS_PATH_LIMIT = 260;
 // engine's 24-character cap (intentDirNameBase):
 // aidlc/spaces/default/intents/<YYMMDD>-<label>/.aidlc-engine/reviews/requirements-analysis/stage/briefs/<sha256>.md
 // The person's names come on top, so the line says "about": a Unit's name on
-// per-Unit records, the `-2` of a second same-day intent, and the parallel
-// build's Bolt checkout under .aidlc/worktrees/<bolt>/.
+// per-Unit records (UNIT_RECORD_DEPTH, once the Units are named), the `-2` of
+// a second same-day intent, and the parallel build's Bolt checkout under
+// .aidlc/worktrees/<bolt>/.
 // t-windows-deep-folder checks the review paths the engine builds stay within it.
 export const RECORD_DEPTH = 185;
+
+// The deepest per-Unit record is the review brief of the longest per-Unit
+// stage name with a reviewer. Under the work's record folder it takes this
+// many characters before the Unit's own name:
+// /.aidlc-engine/reviews/infrastructure-design/units/<unit>/briefs/<sha256>.md
+export const UNIT_RECORD_SUFFIX = 126;
+
+// The same record in the default space with the label at its cap, the count
+// when the work's own record folder is not known:
+// aidlc/spaces/default/intents/<YYMMDD>-<label>/.aidlc-engine/reviews/infrastructure-design/units/<unit>/briefs/<sha256>.md
+// t-windows-deep-folder-gate checks the per-Unit review paths stay within it.
+export const UNIT_RECORD_DEPTH = 186;
 
 export interface DeepFolder {
   /** The project folder's length in characters. */
   depth: number;
-  /** What AI-DLC's records add under it (RECORD_DEPTH). */
+  /** What AI-DLC's records add under it: RECORD_DEPTH, or the per-Unit records' depth with the longest Unit name. */
   adds: number;
   /** Doctor's row after "Project folder: ". */
   facts: string;
@@ -35,15 +48,25 @@ export interface DeepFolder {
 /**
  * On Windows, a project folder deep enough that AI-DLC's records would pass
  * 260 characters; null on any other platform and for a folder short enough.
+ * With the work's Unit names, their per-Unit records are counted too, under
+ * the work's own record folder (relative to the project) when it is given.
  * Reads nothing but the path.
  */
-export function deepFolder(projectDir: string, platform: NodeJS.Platform = process.platform): DeepFolder | null {
+export function deepFolder(
+  projectDir: string,
+  platform: NodeJS.Platform = process.platform,
+  units?: { names: readonly string[]; recordFolder?: string | null },
+): DeepFolder | null {
   if (platform !== "win32") return null;
   const folder = win32.resolve(projectDir);
   const depth = folder.length;
-  if (depth + 1 + RECORD_DEPTH <= WINDOWS_PATH_LIMIT) return null;
+  const longest = Math.max(0, ...(units?.names ?? []).map((name) => name.length));
+  const adds = units && units.names.length > 0
+    ? (units.recordFolder ? units.recordFolder.length + UNIT_RECORD_SUFFIX : UNIT_RECORD_DEPTH) + longest
+    : RECORD_DEPTH;
+  if (depth + 1 + adds <= WINDOWS_PATH_LIMIT) return null;
   const facts = `${depth} characters deep; Windows tools refuse paths over ${WINDOWS_PATH_LIMIT} characters ` +
-    `and AI-DLC's records add about ${RECORD_DEPTH}`;
+    `and AI-DLC's records add about ${adds}`;
   const fix = `move the project to a shorter folder (for example C:\\src\\${win32.basename(folder)})`;
-  return { depth, adds: RECORD_DEPTH, facts, fix, note: `This project folder is ${facts}, so ${fix}.` };
+  return { depth, adds, facts, fix, note: `This project folder is ${facts}, so ${fix}.` };
 }
