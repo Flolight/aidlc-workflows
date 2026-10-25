@@ -4,7 +4,7 @@
 // function:firstPlannedStageOfPhase, function:customPlanBase, function:customPlanStart,
 // function:guardPolicyAtLeast,
 // function:composerScoresPath, function:openComposerScores, function:takeComposerScores,
-// function:approvedComposerPlan,
+// function:approvedComposerPlan, function:planApprovalCreationAsked,
 // function:saveComposedScope, function:writeCompiledGraphLocked,
 // function:delegatedLifecycleCommand,
 // subcommand:aidlc-graph:validate-grid, subcommand:aidlc-utility:intent-create,
@@ -26,7 +26,9 @@
 // its first audit entry, and no other plan or work picks them up (#2575). The
 // stage changes that plan's approval creates are the ones the validator kept
 // for its request, whatever list was typed on Approve, and so is the project
-// type it was validated for when the person typed none.
+// type it was validated for when the person typed none. A custom plan approved
+// with its list also runs at the depth, settings and Guard Policy the gate
+// showed, filled where the command left them out.
 
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -35,6 +37,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { delegatedLifecycleCommand } from "../../core/hooks/aidlc-state-transition-guard.ts";
 import { customPlanBase, customPlanStart, nearestStockScopes, scopeSettingsOf } from "../../core/tools/aidlc-graph.ts";
+import { grantGuardPolicyAtCreation, recordCeremoniesAtCreation, recordPlanApprovalCreationGrant } from "../../core/tools/aidlc-guard-switch.ts";
 import {
   auditFilePath,
   composedPlanLabel,
@@ -1457,6 +1460,7 @@ describe("t351 (10) the plan the person approved is the plan created", () => {
   const engineDir = (proj: string) => join(proj, "aidlc", "spaces", "default", "intents", ".aidlc-engine");
   type Validated = {
     base_scope?: string; plan_changes?: { skip: string[]; add: string[] }; creation_depth?: string; summary?: { shown: number };
+    creation_settings?: Record<string, string>; guard_policy?: string;
   };
   type Printed = { kind: string; message: string; narration: string };
 
@@ -1727,5 +1731,167 @@ describe("t351 (10) the plan the person approved is the plan created", () => {
     const state = stateOf(proj);
     expect(state).toContain("- **Project Type**: Brownfield");
     expect(state).toContain("- **Project Type Source**: workspace scan");
+  });
+
+  // The gate shows the plan's depth, its Guard Policy and its settings beside
+  // its stages, and the agent is told to type them on Approve. One it leaves
+  // out comes from the plan the validator kept, so the work runs as approved.
+  // A value typed with the command stays as typed: unlike a retyped stage
+  // list, it may be the person's own word at Approve.
+  const FLAGS: Record<string, string> = {
+    sensors: "--sensors", learnings: "--learnings", summary_confirmation: "--summary-confirmation",
+    plan_approval: "--plan-approval", collaborators: "--collaborators", review: "--review",
+  };
+  const FIELDS: Record<string, string> = {
+    sensors: "Sensors", learnings: "Learnings", summary_confirmation: "Summary Confirmation",
+    plan_approval: "Plan Approval", collaborators: "Collaborators", review: "Review Override",
+  };
+  const CHAT = "01995000-7a11-7000-8000-000000000352";
+  function nextInChat(proj: string, args: string[]): Printed {
+    const res = runOrchestrateNext(ORCH, proj, args, { cwd: proj, env: { ...process.env, AIDLC_SESSION_OVERRIDE: CHAT } });
+    const parsed = JSON.parse(res.out.split("\n").find((entry) => entry.trim().startsWith("{")) ?? "{}");
+    return { kind: String(parsed.kind), message: String(parsed.message ?? ""), narration: String(parsed.narration ?? "") };
+  }
+  const nearExpress = (): Record<string, string> =>
+    ({ ...stockGrid("express"), "user-stories": "EXECUTE", "units-generation": "EXECUTE", "feedback-optimization": "EXECUTE" });
+
+  test("Approve that types only the stage list still creates the depth, settings and Guard Policy the gate showed", () => {
+    const proj = installedProject();
+    const id = compose(proj);
+    const echoed = validate(proj, { stages: plannedGrid(), scopeSettings: SETTINGS, guardPolicy: "relaxed", depth: "standard" }, ["--custom"]);
+    const base = echoed.base_scope as string;
+    const settings = echoed.creation_settings ?? {};
+    expect(echoed.creation_depth).toBe("standard");
+    expect(Object.keys(settings).length).toBeGreaterThan(0);
+    expect(withEnvAndFreshCaches(POLICY_ENV, () => scopeGuardPolicyDefault(base))).toBe("off");
+    const printed = nextInChat(proj, ["--scope", base, ...lists(echoed.plan_changes as { skip: string[]; add: string[] }), "--request", id]);
+    expect(printed.kind, printed.message).toBe("print");
+    const creation = creationOf(printed);
+    expect(creation).toContain("--depth standard");
+    for (const [key, value] of Object.entries(settings)) expect(creation).toContain(`${FLAGS[key]} ${value}`);
+    expect(creation).toContain("--guard-policy relaxed");
+    expect(creation).toContain(`--message '${MESSAGE_SLOT}'`);
+    const created = runCreation(proj, printed);
+    expect(created.status, created.out).toBe(0);
+    const state = stateOf(proj);
+    expect(state).toMatch(/^- \*\*Depth\*\*: Standard\b/m);
+    expect(state).toMatch(/^- \*\*Guard Policy\*\*: relaxed\b/m);
+    for (const [key, value] of Object.entries(settings)) {
+      expect(state, key).toMatch(new RegExp(`^- \\*\\*${FIELDS[key]}\\*\\*: ${value}\\b`, "m"));
+    }
+  });
+
+  test("a depth or setting typed with Approve stays as typed", () => {
+    const proj = installedProject();
+    const id = compose(proj);
+    const echoed = validate(proj, { stages: plannedGrid(), scopeSettings: SETTINGS, guardPolicy: "relaxed", depth: "standard" }, ["--custom"]);
+    const [key, value] = Object.entries(echoed.creation_settings ?? {}).find(([k]) => k !== "review") as [string, string];
+    const other = value === "on" ? "off" : "on";
+    const creation = creationOf(nextInChat(proj, [
+      "--scope", echoed.base_scope as string, ...lists(echoed.plan_changes as { skip: string[]; add: string[] }),
+      "--depth", "comprehensive", FLAGS[key], other, "--guard-policy", "strict", "--request", id,
+    ]));
+    expect(creation).toContain("--depth comprehensive");
+    expect(creation).not.toContain("--depth standard");
+    expect(creation).toContain(`${FLAGS[key]} ${other}`);
+    expect(creation).not.toContain(`${FLAGS[key]} ${value}`);
+    expect(creation).toContain("--guard-policy strict");
+    expect(creation).not.toContain("--guard-policy relaxed");
+  });
+
+  test("what the person said for this request before it was created is left for creation to apply", () => {
+    // On an express base the plan turns plan approval on; the person asked for
+    // it off at the gate, so the plan's on never goes over their words.
+    const proj = installedProject();
+    const id = compose(proj);
+    const echoed = validate(proj, { stages: nearExpress(), scopeSettings: SETTINGS, guardPolicy: "off", depth: "minimal" }, ["--custom"]);
+    expect(echoed.base_scope).toBe("express");
+    expect(echoed.creation_settings).toMatchObject({ plan_approval: "on", learnings: "on" });
+    recordPlanApprovalCreationGrant(proj, CHAT);
+    recordCeremoniesAtCreation(proj, CHAT, { learnings: "off" }, false);
+    const printed = nextInChat(proj, ["--scope", "express", ...lists(echoed.plan_changes as { skip: string[]; add: string[] }), "--request", id]);
+    const creation = creationOf(printed);
+    expect(creation).not.toContain("--plan-approval");
+    expect(creation).not.toContain("--learnings");
+    expect(creation).toContain("--sensors on");
+    const created = runCreation(proj, printed);
+    expect(created.status, created.out).toBe(0);
+    const state = stateOf(proj);
+    expect(state).toMatch(/^- \*\*Plan Approval\*\*: off\b/m);
+    expect(state).toMatch(/^- \*\*Learnings\*\*: off\b/m);
+    expect(state).toMatch(/^- \*\*Sensors\*\*: on\b/m);
+
+    // The plan raises Guard Policy to relaxed on its off base; the person asked
+    // for it off before the work existed, so their off stands.
+    const policy = installedProject();
+    const policyId = compose(policy);
+    const raised = validate(policy, { stages: plannedGrid(), scopeSettings: SETTINGS, guardPolicy: "relaxed", depth: "standard" }, ["--custom"]);
+    expect(withEnvAndFreshCaches(POLICY_ENV, () => scopeGuardPolicyDefault(raised.base_scope as string))).toBe("off");
+    expect(grantGuardPolicyAtCreation(policy, CHAT, null, "off").applied).toBe(true);
+    const policyPrinted = nextInChat(policy, [
+      "--scope", raised.base_scope as string, ...lists(raised.plan_changes as { skip: string[]; add: string[] }), "--request", policyId,
+    ]);
+    expect(creationOf(policyPrinted)).not.toContain("--guard-policy");
+    expect(creationOf(policyPrinted)).toContain("--depth standard");
+    const policyCreated = runCreation(policy, policyPrinted);
+    expect(policyCreated.status, policyCreated.out).toBe(0);
+    expect(stateOf(policy)).toMatch(/^- \*\*Guard Policy\*\*: off\b/m);
+  });
+
+  test("a depth or review level the person set for the next work before it existed is left for creation to apply", () => {
+    // Set with no work selected ("make the next one comprehensive, with full
+    // reviews"), kept by the setter for the request; the plan's own depth and
+    // review level never go over it.
+    const proj = installedProject();
+    const id = compose(proj);
+    const echoed = validate(proj, { stages: plannedGrid(), scopeSettings: SETTINGS, guardPolicy: "relaxed", depth: "standard" }, ["--custom"]);
+    expect(echoed.creation_depth).toBe("standard");
+    expect(echoed.creation_settings).toMatchObject({ review: "advisory" });
+    recordCeremoniesAtCreation(proj, CHAT, { depth: "comprehensive", review: "adversarial" }, false);
+    const printed = nextInChat(proj, ["--scope", echoed.base_scope as string, ...lists(echoed.plan_changes as { skip: string[]; add: string[] }), "--request", id]);
+    const creation = creationOf(printed);
+    expect(creation).not.toContain("--depth");
+    expect(creation).not.toContain("--review");
+    expect(creation).toContain("--guard-policy relaxed");
+    const created = runCreation(proj, printed);
+    expect(created.status, created.out).toBe(0);
+    const state = stateOf(proj);
+    expect(state).toMatch(/^- \*\*Depth\*\*: Comprehensive\b/m);
+    expect(state).toContain("- **Review Override**: adversarial");
+  });
+
+  test("a matched plan, the plain base after a Reject, and a kept value outside its words fill nothing", () => {
+    // A matched plan has no list to tell an Approve from a plain pick of that
+    // scope after a Reject, so its settings stay as typed.
+    const matched = installedProject();
+    const matchedId = compose(matched, "fix the flaky date parser");
+    const bugfix = withEnvAndFreshCaches(POLICY_ENV, () => scopeSettingsOf("bugfix")!);
+    const echoedMatched = validate(matched, { stages: stockGrid("bugfix"), scopeSettings: { ...bugfix, learnings: "on" }, guardPolicy: "relaxed" }, ["--matched", "bugfix"]);
+    expect(echoedMatched.creation_settings).toEqual({ learnings: "on" });
+    const plainMatched = creationOf(nextInChat(matched, ["--scope", "bugfix", "--request", matchedId]));
+    expect(plainMatched).not.toContain("--learnings");
+    expect(plainMatched).not.toContain("--guard-policy");
+
+    const proj = installedProject();
+    const id = compose(proj);
+    const echoed = validate(proj, { stages: plannedGrid(), scopeSettings: SETTINGS, guardPolicy: "relaxed", depth: "standard" }, ["--custom"]);
+    const base = echoed.base_scope as string;
+    const approved = echoed.plan_changes as { skip: string[]; add: string[] };
+    const plain = creationOf(nextInChat(proj, ["--scope", base, "--request", id]));
+    expect(plain).not.toContain("--depth");
+    expect(plain).not.toContain("--guard-policy");
+    for (const key of Object.keys(echoed.creation_settings ?? {})) expect(plain).not.toContain(FLAGS[key]);
+    // A record edited by hand keeps its stage changes and nothing it cannot read.
+    const recordPath = join(engineDir(proj), "composer-scores.json");
+    const record = JSON.parse(readFileSync(recordPath, "utf-8"));
+    writeFileSync(recordPath, JSON.stringify({
+      ...record,
+      plan: { ...record.plan, depth: "standard --plan-approval off", settings: { learnings: "on; rm" }, guardPolicy: "off" },
+    }));
+    const junk = creationOf(nextInChat(proj, ["--scope", base, ...lists(approved), "--request", id]));
+    expect(junk).toContain(`--add ${approved.add.join(",")}`);
+    expect(junk).not.toContain("--depth");
+    expect(junk).not.toContain("--learnings");
+    expect(junk).not.toContain("--guard-policy");
   });
 });
