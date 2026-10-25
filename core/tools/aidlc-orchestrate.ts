@@ -3876,6 +3876,9 @@ function openQuestionAgainDirective(
   projectDir: string,
   { stage, block, alone }: { stage: string; block: string; alone: boolean },
   stateContent: string,
+  // What follows their answer when a report waits on it: the question was never
+  // shown, and the way on after it is that report's, not the stage's next step.
+  afterAnswer?: string,
 ): PrintDirective | null {
   const checkpoint = auditBlockField(block, "Checkpoint");
   if (checkpoint !== null && checkpoint !== CONSTRUCTION_POLICY_CHECKPOINT) return null;
@@ -3895,12 +3898,67 @@ function openQuestionAgainDirective(
   // Their reply is not in yet: whether it will be kept is read from the turn that ran this.
   const answer = openQuestionAnswer(stage, block, personsWordsKept(projectDir), alone, stateContent);
   return printDirective(
-    `Stage "${stage}" has a question you asked that the person has not answered yet. Show it to them again, word ` +
-      `for word as it was asked, with its choices, and end your turn: ${JSON.stringify(decision)}` +
+    `Stage "${stage}" has a question you asked that the person has not answered yet. Show it to them` +
+      `${afterAnswer === undefined ? " again" : ""}, word for word as it was asked, with its choices, and end your turn: ` +
+      `${JSON.stringify(decision)}` +
       `${choices.length > 0 ? `, with the choices ${choices.map((choice) => JSON.stringify(choice)).join(", ")}` : ""}. ` +
-      `When they answer it, ${answer}, then carry on with "${stage}" from where you asked ` +
-      `and run bare \`${aidlcToolInvocation("orchestrate")} next\` the next time you need the engine. If they say ` +
-      "something else, pass their words to `next` and follow what it returns.",
+      `When they answer it, ${answer}, then ` +
+      (afterAnswer ??
+        `carry on with "${stage}" from where you asked and run bare \`${aidlcToolInvocation("orchestrate")} next\` ` +
+          "the next time you need the engine.") +
+      " If they say something else, pass their words to `next` and follow what it returns.",
+  );
+}
+
+// Whether an answer to a question of `stage` is on record since the stage last
+// started in the main workflow.
+function stageAnsweredSinceStart(projectDir: string, stage: string): boolean {
+  try {
+    const rows = readAuditShardEvents(projectDir);
+    const ofStage = (row: { block: string }) => auditBlockField(row.block, "Stage") === stage;
+    const start = rows
+      .filter((row) => row.event === "STAGE_STARTED" && ofStage(row) &&
+        auditBlockField(row.block, "Workflow")?.startsWith("single-stage:") !== true)
+      .map((row) => row.timestamp)
+      .sort()
+      .at(-1);
+    return start !== undefined && rows.some((row) => row.event === "QUESTION_ANSWERED" && ofStage(row) && row.timestamp >= start);
+  } catch {
+    return false;
+  }
+}
+
+// A skip that rests on the person's keep choice alone stands on their own
+// answer to the stage's question (live on opencode the agent took the reuse on
+// itself, its answer was refused for want of a reply, and the skip recorded
+// "human chose reuse"). Presence is `log answer`'s; this reads only that the
+// answer is on record. The step shows the open question, or says how to record
+// one, and the skip waits; null when the answer is on record.
+function reuseSkipWaitsOnAnswer(projectDir: string, stage: string, stateContent: string, reason: string): Directive | null {
+  const report = `${aidlcToolInvocation("orchestrate")} report --stage ${shellArg(stage)} --result skipped ` +
+    `--reason ${shellArg(reason)}`;
+  // Their answer may keep the knowledge base or ask for a scan: the skip is the way on only for the first.
+  const wayOn = `if they chose to keep the existing knowledge base, run the same skip report again: \`${report}\`; ` +
+    `if they chose a scan, carry on with "${stage}"'s scan from where you asked.`;
+  const block = openPendingDecision(projectDir, stage, "STAGE_STARTED");
+  if (block !== null && decisionWaitsOnPerson(stateContent, block)) {
+    const menu = openDecisionMenu(projectDir, stage, "STAGE_STARTED");
+    const alone = menu.filter((row) => auditBlockField(row, "Checkpoint") === null).length <= 1;
+    const show = openQuestionAgainDirective(projectDir, { stage, block, alone }, stateContent, wayOn);
+    if (show !== null) {
+      leadsToSpeech.add(show);
+      turnEndingPrints.add(show);
+      return show;
+    }
+  } else if (stageAnsweredSinceStart(projectDir, stage)) {
+    return null;
+  }
+  return errorDirective(
+    `"${stage}" is skipped on the person's choice to reuse the code knowledge base, and no answer of theirs to its ` +
+      "question is on record, so nothing was skipped. Record the question you asked them " +
+      `(\`${aidlcToolInvocation("log")} decision\`) and, if they already answered it in this chat, their answer ` +
+      `(\`${aidlcToolInvocation("log")} answer\`, which pairs a question logged after their reply with it); only if ` +
+      `they have not seen it, show it to them and end your turn. Then, ${wayOn}`,
   );
 }
 
@@ -18541,6 +18599,14 @@ function handleReport(args: string[], projectDir: string | undefined): void {
     // choice covers every repository the stage reads and no scan ran.
     const evidence = node.mode === "pipeline" ? pipelineLinkEvidence(pd, node) : null;
     const reusedStore = evidence !== null && evidence.missing.length === 0 && evidence.receipts.length === 0;
+    // Their own skip, and an unattended run, where nobody answers, go on as before.
+    if (reusedStore && !personAsked && humanTurnMintAllowed()) {
+      const waits = reuseSkipWaitsOnAnswer(pd, slug, stateContent, reason);
+      if (waits !== null) {
+        emit(waits);
+        return;
+      }
+    }
     const res = spawnState(pd, [
       "skip",
       slug,
