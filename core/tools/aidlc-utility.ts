@@ -479,6 +479,7 @@ import {
   OWN_TERMINAL_PRESENCE_STEP,
   personAtOwnTerminal,
   personAskedForThisLowering,
+  turnsPlanApprovalOff,
   personAskedSinceGate,
   personSaidProjectType,
   CONDUCTOR_SUMMARY_FIELD,
@@ -7934,7 +7935,7 @@ function answerAlreadyStarted(projectDir: string, questionId: string, sessionId?
 // the CREATED intent's record (the active-intent cursor set first makes the
 // default-resolving state/audit helpers resolve there).
 function handleIntentCreate(projectDir: string, flags: Record<string, string>): void {
-  const named = setterMessage(projectDir, flags);
+  const named = setterMessage(projectDir, flags, false, { newWork: true });
   // An engine question's answer names its request by id. The copy is removed
   // once the answer starts work, so look for that work before the copy.
   const questionId = flags.request;
@@ -12991,12 +12992,15 @@ function setterMessage(
   projectDir: string,
   flags: Record<string, string>,
   unreadableIsNone = false,
+  { newWork = false } = {},
 ): { message?: StoredMessage; agentText?: string } {
   readPersonWordsFile(projectDir, flags, unreadableIsNone);
   const words = flags["person-words"];
   const agentText = words === undefined || words === "true" ? undefined : words.replace(/\s+/g, " ").trim() || undefined;
   if (flags.message === undefined) return { agentText };
-  const proof = proveMessage(projectDir, flags.message, "setting", { request: true });
+  // New work's own plan approval leaves the plan question that waits now as it is.
+  const planApprovalOff = !newWork && Object.entries(flags).some(([key, value]) => turnsPlanApprovalOff(key, value));
+  const proof = proveMessage(projectDir, flags.message, "setting", { request: true, planApprovalOff });
   if ("refusal" in proof) die(proof.refusal);
   return { message: proof.message, agentText };
 }

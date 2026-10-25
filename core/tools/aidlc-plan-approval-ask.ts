@@ -86,6 +86,7 @@ import {
   codeGenerationBuildsWithoutSource,
   clearPlanApprovalOverrideOffered,
   codeGenerationExecutionAllowed,
+  codeGenerationIssuance,
   codeGenerationRecordDir,
   codeGenerationTargetId,
   evaluateCodeGenerationApproval,
@@ -186,6 +187,8 @@ export interface PlanApprovalAskRecord {
   replies?: PlanApprovalAskReply[];
   /** Where the audit trail stood when the question was shown: an answer needs a reply after it. */
   repliesFrom?: AuditMark;
+  /** Where it stood when this question was shown; their edit of the files moves repliesFrom, not this. */
+  shownFrom?: AuditMark;
   /** A grouped change request that named no Unit, waiting for "which one". */
   pendingChange?: string;
   results?: PlanApprovalAskResult[];
@@ -1109,7 +1112,7 @@ export function publishPlanApprovalAsk(
           mode: "ask",
           bound: true,
           ...shownNow(null, session),
-          repliesFrom: auditMark(projectDir),
+          ...shownFromNow(projectDir),
         };
     writePlanApprovalAsk(projectDir, record);
     directive.plan_approval.targets.forEach((view, index) => {
@@ -1299,9 +1302,41 @@ function currentPlanApprovalAsk(
   return same ? { marker, record } : null;
 }
 
-/** When the Plan Approval question was last shown, while it is the open step with no answer yet; else null. */
-export function planQuestionShownAt(projectDir: string): string | null {
-  return currentPlanApprovalAsk(projectDir)?.record.issuedAt ?? null;
+// A question shown fresh: its answer and what was said since both start here.
+function shownFromNow(projectDir: string): { repliesFrom: AuditMark; shownFrom: AuditMark } {
+  const mark = auditMark(projectDir);
+  return { repliesFrom: mark, shownFrom: mark };
+}
+
+/**
+ * Where the record stood when the Plan Approval question was shown, while it is
+ * the open step with a plan still unanswered; "due" while the step on record
+ * builds a written plan that `next` would ask about now, its question not shown
+ * yet; else null. A record from before shownFrom reads the mark its answer
+ * reads (repliesFrom, personRepliedAfter).
+ */
+export function planQuestionShown(projectDir: string): AuditMark | "due" | null {
+  const record = currentPlanApprovalAsk(projectDir, "some")?.record;
+  if (record !== undefined) return record.shownFrom ?? record.repliesFrom ?? null;
+  return planQuestionDue(projectDir) ? "due" : null;
+}
+
+// The plan step is on record and a plan it builds is ready for the person's
+// approval, read the way `next` routes it (targetState).
+function planQuestionDue(projectDir: string): boolean {
+  try {
+    const marker = readActiveDirectiveMarker(projectDir, readFileSync(stateFilePath(projectDir), "utf-8"));
+    if (marker?.version !== 2 || marker.kind === "ask") return false;
+    const issued = codeGenerationIssuance(marker);
+    if (issued === null) return false;
+    const intentId = marker.intent_uuid ?? "bare-space";
+    const record = readPlanApprovalAsk(projectDir, intentId);
+    const units = issued.kind === "invoke-swarm" ? issued.units : [issued.unit?.trim() || null];
+    const off = planApprovalSettingFor(projectDir)?.value === "off";
+    return units.some((unit) => targetState(projectDir, unit, intentId, record, issued, off).kind === "ask");
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -2015,7 +2050,7 @@ export function recordPlanApprovalAnswer(
         "The person has not answered the plan question since it was shown: their message since then was a " +
           "question or a command to AIDLC, not an answer. Answer them and end the turn. If they want plan approval " +
           `off for this work, run \`${aidlcDispatcherInvocation("config set guard.plan-approval off")} --message ` +
-          `'${MESSAGE_SLOT}'\`${messageFill(projectDir)}, and say so in one line. Then record the choice they make.`,
+          `'${MESSAGE_SLOT}'\`${messageFill(projectDir, ["plan-approval off"])}, and say so in one line. Then record the choice they make.`,
       );
     }
     // Their words, whole: what to change when they asked for changes.
@@ -2304,7 +2339,7 @@ export function requestPlanApprovalReviewNow(projectDir: string): string | null 
       asked.targets.some((target) => looked.includes(target.unit)))) {
       const results = (asked.results ?? []).filter((result) => !looked.includes(result.unit));
       const reopened: PlanApprovalAskRecord = {
-        ...asked, askId: randomBytes(16).toString("hex"), repliesFrom: auditMark(projectDir), bound: true,
+        ...asked, askId: randomBytes(16).toString("hex"), ...shownFromNow(projectDir), bound: true,
       };
       delete reopened.replies;
       if (results.length > 0) reopened.results = results; else delete reopened.results;
