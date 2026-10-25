@@ -227,6 +227,7 @@ import {
   constructionCheckpointGaps,
   effectivePlanAction,
   addReachesPassedOver,
+  stageSkippedWhereItStood,
   constructionHasStarted,
   owedJumpBack,
   errorMessage,
@@ -10854,7 +10855,9 @@ function routeNext(agentArgs: string[], projectDir: string | undefined): void {
       stateContent,
       walk: planChanges ? planChangeWalk(pd, currentStateScope, stateContent) : null,
       together: planChanges ? openGateApprovesTogether(pd, (getField(stateContent, "Current Stage") ?? "").trim()) : [],
-      passedOver: planChanges ? planChanges.add.filter((slug) => addReachesPassedOver(stateContent, slug, recordDir(pd))) : [],
+      passedOver: planChanges
+        ? planChanges.add.filter((slug) => addReachesPassedOver(stateContent, slug, recordDir(pd), planChanges.add))
+        : [],
     };
     // Words typed with a differing scope may be new work or the reason for
     // the change: Branch 9c asks which, so they are never dropped.
@@ -15780,8 +15783,12 @@ function planChangeDirective(
   // A stage the plan already skips or runs is no change: it is said, not sent
   // to recompose, so the undo line names only what changed. After a scope
   // change (plan null) the new plan is not known here, so every flip is sent.
+  // A stage the work skipped where it stood does not run, whatever the plan
+  // says, so adding it puts it back.
+  const skippedWhereItStood = (slug: string): boolean => plan !== null && stageSkippedWhereItStood(plan.stateContent, slug);
   const already = (slug: string, action: "EXECUTE" | "SKIP"): boolean =>
-    plan !== null && effectivePlanAction(slug, plan.scope, plan.stateContent) === action;
+    plan !== null && effectivePlanAction(slug, plan.scope, plan.stateContent) === action &&
+    !(action === "EXECUTE" && skippedWhereItStood(slug));
   const skip = [...new Set(changes.skip)].filter((slug) => !already(slug, "SKIP"));
   const add = [...new Set(changes.add)].filter((slug) => !already(slug, "EXECUTE"));
   const unchanged = [
@@ -15858,9 +15865,12 @@ function planChangeDirective(
   const oneUnitOnly = (slugs: string[]): string =>
     `${listed(slugs.map(name))} can be skipped for one Unit while that Unit is working on it`;
   const notNow = (slugs: string[]): string => `${oneUnitOnly(slugs)}; the ${unitName} Unit is ${unitIsAt} now.`;
+  const putBack = add.filter(skippedWhereItStood);
+  const newlyAdded = add.filter((slug) => !putBack.includes(slug));
   const summary = [
     ...(skip.length > 0 ? [`skipped ${listed(skip.map(skipName))}`] : []),
-    ...(add.length > 0 ? [`added ${named(add)}`] : []),
+    ...(newlyAdded.length > 0 ? [`added ${named(newlyAdded)}`] : []),
+    ...(putBack.length > 0 ? [`put ${named(putBack)} back on the plan`] : []),
   ].join(" and ");
   const startedSkip = started === null ? null
     : `${aidlcToolInvocation("orchestrate")} report --stage ${started} --result skipped ` +

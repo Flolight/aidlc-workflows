@@ -289,6 +289,23 @@ describe("a skip the person asks for while Construction walks Unit by Unit is ca
     expect(after.construction_checkpoint ?? null).toBeNull();
   });
 
+  // Marked skipped because every Unit skipped it, not skipped where it stood:
+  // its Units' skips, not its mark, say who owes it, so an add does not claim
+  // to put it back (the way back is the Unit's own run the skip line named).
+  test("a stage every Unit skipped, added again, is not said to be back on the plan, and its mark stays", () => {
+    const proj = walk(["alpha"]);
+    expect(runNamed(proj, THIS_UNIT).status).toBe(0);
+    const before = readFileSync(stateFile(proj), "utf-8");
+    expect(before).toContain("- [S] code-generation \u2014 EXECUTE");
+    const step = next(proj, ["--add", "code-generation"]);
+    expect(String(step.message), JSON.stringify(step)).not.toContain("back on the plan");
+    expect(String(step.message), JSON.stringify(step)).not.toContain("recompose --add");
+    const added = run(proj, "aidlc.ts", ["engine", "recompose", "--add", "code-generation"]);
+    expect(added.status, added.out).not.toBe(0);
+    expect(added.out).toContain("its checkbox is not pending ([skipped])");
+    expect(readFileSync(stateFile(proj), "utf-8")).toBe(before);
+  });
+
   test("Code Generation named while the Unit is still on its design: the step says it covers every Unit", () => {
     const proj = walk(["alpha", "beta"], false);
     const step = next(proj, ["--skip", "code-generation"]);
@@ -516,6 +533,25 @@ describe("a skip the person asks for at the walk's first stage, while a Unit is 
       at = next(proj);
     }
     expect(`${at.kind} ${at.stage}/${at.unit}`, JSON.stringify(at)).toBe("run-stage nfr-requirements/beta");
+  });
+
+  test("every Unit from here, then asked back as the next stage starts: it is back on the plan and alpha runs it next", () => {
+    const proj = walk(["alpha", "beta"], false);
+    next(proj, ["--skip", "functional-design"]);
+    expect(runNamed(proj, FIRST_EVERY_UNIT).status).toBe(0);
+    expect(readFileSync(stateFile(proj), "utf-8")).toContain("- **Current Stage**: nfr-requirements");
+    const step = next(proj, ["--add", "functional-design"]);
+    expect(String(step.message), JSON.stringify(step)).toContain("Put Functional Design back on the plan.");
+    const added = run(proj, "aidlc.ts", ["engine", "recompose", "--add", "functional-design"]);
+    expect(added.status, added.out).toBe(0);
+    expect(readFileSync(stateFile(proj), "utf-8")).toContain("- [ ] functional-design \u2014 EXECUTE");
+    const route = next(proj);
+    const jump = /`[^`]*aidlc-jump\.ts (execute --target functional-design --direction backward[^`]*)`/.exec(String(route.message))?.[1];
+    expect(jump, JSON.stringify(route)).toBeDefined();
+    const jumped = run(proj, "aidlc-jump.ts", String(jump).split(" "));
+    expect(jumped.status, jumped.out).toBe(0);
+    const at = next(proj);
+    expect(`${at.kind} ${at.stage}/${at.unit}`, JSON.stringify(at)).toBe("run-stage functional-design/alpha");
   });
 
   test("every Unit from here in the person's own words: the next stage's question is not handed them", () => {

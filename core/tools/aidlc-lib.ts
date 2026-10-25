@@ -42504,44 +42504,78 @@ export function reverseEngineeringOwedBehindCursor(content: string, workRecordDi
     !constructionHasStarted(content, workRecordDir);
 }
 
-// The stages on the plan that its scope skips and that the work has just
-// passed over: behind the current stage and never started, with nothing after
-// them started but the current stage, which an approval or a jump only just
-// entered (in progress, and nothing of it in the work's record: its own folder,
-// `<phase>/<slug>`, and each Unit's, `<phase>/<unit>/<slug>`, hold no file; the
-// stages before it wrote theirs elsewhere). Reverse Engineering behind the
-// cursor has its own rule (reverseEngineeringOwedBehindCursor).
+// The stages on the plan that the work has just passed over: behind the
+// current stage and not started, with nothing after them started but the
+// current stage, which an approval or a jump only just entered (in progress,
+// and nothing of it in the work's record: its own folder, `<phase>/<slug>`, and
+// each Unit's, `<phase>/<unit>/<slug>`, hold no file; the stages before it
+// wrote theirs elsewhere). Which of them an add put back is the callers' to
+// say (addReachesPassedOver, addedStagesPassedOver). Reverse Engineering
+// behind the cursor has its own rule (reverseEngineeringOwedBehindCursor).
 function stagesPassedOverJustNow(content: string, workRecordDir: string | null | undefined): string[] {
   const scope = getField(content, "Scope")?.trim() ?? "";
-  const def = loadScopeMapping()[scope];
-  if (!def || !workRecordDir) return [];
-  const grid: Record<string, "EXECUTE" | "SKIP"> = {};
-  for (const [slug, action] of Object.entries(def.stages)) grid[slug] = action === "EXECUTE" ? "EXECUTE" : "SKIP";
-  const added = planChangesBetween(grid, Object.fromEntries(parseStateStageSuffixes(content))).add
-    .filter((slug) => slug !== "reverse-engineering");
-  if (added.length === 0) return [];
+  if (!loadScopeMapping()[scope] || !workRecordDir) return [];
   const current = getField(content, "Current Stage")?.trim() ?? "";
   const graph = loadStageGraph();
   const now = graph.findIndex((stage) => stage.slug === current);
   const boxes = new Map(parseCheckboxes(content).map((c) => [c.slug, c.state]));
   if (now < 0 || boxes.get(current) !== "in-progress") return [];
+  const passed = graph.slice(0, now)
+    .filter((stage, at) => stage.slug !== "reverse-engineering" &&
+      graph.slice(at).every((later) => later.slug === current || (boxes.get(later.slug) ?? "pending") === "pending") &&
+      effectivePlanAction(stage.slug, scope, content) === "EXECUTE")
+    .map((stage) => stage.slug);
+  if (passed.length === 0) return [];
   const entered = graph[now];
   const phaseDir = join(workRecordDir, entered.phase);
   const holdsItsWork = (dir: string): boolean => holdsAnyFile(join(dir, entered.slug));
   if (holdsItsWork(phaseDir) || (existsSync(phaseDir) && readdirSync(phaseDir, { withFileTypes: true })
     .some((entry) => entry.isDirectory() && holdsItsWork(join(phaseDir, entry.name))))) return [];
-  return added.filter((slug) => {
-    const at = graph.findIndex((stage) => stage.slug === slug);
-    return at >= 0 && at < now && graph.slice(at).every((stage) =>
-      stage.slug === current || (boxes.get(stage.slug) ?? "pending") === "pending");
-  });
+  return passed;
 }
 
-// Whether an add of `slug` puts on the plan a stage the work has just passed
-// over (stagesPassedOverJustNow): recompose takes such an add, and the step
-// that names it carries on into the stage.
-export function addReachesPassedOver(content: string, slug: string, workRecordDir: string | null | undefined): boolean {
-  return stagesPassedOverJustNow(setStageSuffix(content, slug, "EXECUTE"), workRecordDir).includes(slug);
+// A stage added to the running plan: on the plan, and, when the work skipped
+// it where it stood ([S]), not started again, so the work reaches it, the way
+// a project-type change puts Reverse Engineering back. Recompose writes it, and
+// the checks of whether `next` still reaches the stage read the add this way.
+export function stageAddedBack(content: string, slug: string): string {
+  const added = setStageSuffix(content, slug, "EXECUTE");
+  return parseCheckboxes(added).some((c) => c.slug === slug && c.state === "skipped")
+    ? setCheckbox(added, slug, "pending")
+    : added;
+}
+
+// A stage the work skipped where it stood: marked skipped behind the current
+// stage, which the work went on to; going back to it starts it again, for
+// every Unit too. One marked skipped ahead of the current stage is not: a Unit
+// walk marks a later step so once every Unit skipped it, while Current Stage
+// stays on the walk's first step, and its Units' skips, not its mark, say who
+// owes it.
+export function stageSkippedWhereItStood(content: string, slug: string): boolean {
+  const graph = loadStageGraph();
+  const at = graph.findIndex((stage) => stage.slug === slug);
+  const now = graph.findIndex((stage) => stage.slug === getField(content, "Current Stage")?.trim());
+  return at >= 0 && at < now && parseCheckboxes(content).some((c) => c.slug === slug && c.state === "skipped");
+}
+
+// Whether an add of `slug` puts back a stage the work has just passed over
+// (stagesPassedOverJustNow): one its scope skips, or one the work skipped where
+// it stood. A stage the scope runs that the work passed another way (behind
+// the cursor after a scope change) stays as it is. It is read with every stage
+// the same add puts back (`together`), so stages skipped one after another come
+// back together. Recompose takes such an add, and the step that names it
+// carries on into the stage.
+export function addReachesPassedOver(
+  content: string,
+  slug: string,
+  workRecordDir: string | null | undefined,
+  together: readonly string[] = [],
+): boolean {
+  const scopeRuns = loadScopeMapping()[getField(content, "Scope")?.trim() ?? ""]?.stages[slug] === "EXECUTE";
+  const skippedWhereItStood = parseCheckboxes(content).some((c) => c.slug === slug && c.state === "skipped");
+  if (scopeRuns && !skippedWhereItStood) return false;
+  const added = [...new Set([slug, ...together])].reduce((state, each) => stageAddedBack(state, each), content);
+  return stagesPassedOverJustNow(added, workRecordDir).includes(slug);
 }
 
 // The stages the person put back on the plan after the work had just passed
@@ -42550,8 +42584,8 @@ export function addReachesPassedOver(content: string, slug: string, workRecordDi
 // writes for an add addReachesPassedOver lets through). `next` goes back to
 // the first, as the work would have gone on to it had the add come before the
 // approval, and the jump it names is the engine's own move. A stage on the plan
-// behind the cursor with no such add (a plan whose rows say so from the start)
-// stays as it is.
+// behind the cursor with no such add (a plan whose rows say so from the start,
+// a scope change's) stays as it is.
 export function addedStagesPassedOver(content: string, projectDir: string, intent?: string, space?: string): string[] {
   const passed = stagesPassedOverJustNow(content, recordDir(projectDir, intent, space));
   if (passed.length === 0) return [];
