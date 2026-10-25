@@ -10852,12 +10852,12 @@ function routeNext(agentArgs: string[], projectDir: string | undefined): void {
       // next line.
       const current = (getField(stateContent, "Current Stage") ?? "").trim();
       const gateWaits = keepsPlace && stillParked === null &&
-        parseCheckboxes(stateContent).find((c) => c.slug === current)?.state === "awaiting-approval" &&
-        !practicesApprovalHeld(pd, current, stateContent);
+        parseCheckboxes(stateContent).find((c) => c.slug === current)?.state === "awaiting-approval";
       const switched = carriesOn
         ? printDirective(`Run \`${command}\` to change scope${fill}, then print its output verbatim and re-run next to carry on with the work.`)
         : turnEndingPrint(gateWaits
-          ? `Run \`${command}\` to change scope${fill}, then print its output verbatim. ${openGateAnswerStep(current)}`
+          ? `Run \`${command}\` to change scope${fill}, then print its output verbatim. ` +
+            openGateAnswerStep(current, practicesApprovalHeld(pd, current, stateContent))
           : `Run \`${command}\` to change scope${fill}, then ${verbatimThenStop}`);
       emit(planChanges ? planChangeDirective(planChanges, command, null, planApprovalAskIsOpen(pd), stillParked, fill) : keptWhilePlanWaits(
         keepsPlace ? withWorkPicksUpLine(switched, pd, currentStateScope, stateContent) : switched,
@@ -15639,10 +15639,20 @@ function keptWhilePlanWaits<T extends Directive>(directive: T, planWaits: boolea
 
 // The answer to the open gate that the person's message may also give, for a
 // change made at that gate (a plan change, a scope switch): recorded after the
-// change, so the change and the answer each happen once.
-function openGateAnswerStep(slug: string): string {
-  return `If their message also answered the open ${nodeForSlug(slug)?.name || slug} question, record it now with ` +
-    `\`${aidlcToolInvocation("orchestrate")} report --stage ${slug} --result approved --user-input Approve\` ` +
+// change, so the change and the answer each happen once. While the gate's
+// approval waits for what the stage saves first (Practices Discovery's
+// practices, practicesApprovalHeld), only a change request is handed over; an
+// approval waits for the person's next message.
+function openGateAnswerStep(slug: string, approvalHeld = false): string {
+  const name = nodeForSlug(slug)?.name || slug;
+  const report = `${aidlcToolInvocation("orchestrate")} report --stage ${slug}`;
+  if (approvalHeld) {
+    return `If their message asked for changes at the open ${name} question, record that now with ` +
+      `\`${report} --result rejected --user-input "Request Changes"\` and re-run \`next\`; ` +
+      "otherwise stop: the question still waits.";
+  }
+  return `If their message also answered the open ${name} question, record it now with ` +
+    `\`${report} --result approved --user-input Approve\` ` +
     `(a change request: \`--result rejected --user-input "Request Changes"\`) and re-run \`next\`; ` +
     "otherwise stop: the question still waits.";
 }
@@ -15950,7 +15960,11 @@ function planChangeDirective(
       : turnEndingPrint(`${message}${end} ${undo}${resume}`));
   }
   if (gateOpen !== null) {
-    return kept(turnEndingPrint(`${message} ${openGateAnswerStep(gateOpen)} ${undo}${resume}`));
+    // Practices Discovery's approval waits for the practices the person
+    // approved to be saved (an approval report would be refused in engine
+    // words), so there only a change request is handed over.
+    const held = engineProjectDir !== undefined && practicesApprovalHeld(engineProjectDir, gateOpen, plan!.stateContent);
+    return kept(turnEndingPrint(`${message} ${openGateAnswerStep(gateOpen, held)} ${undo}${resume}`));
   }
   return kept(turnEndingPrint(`${message}${end} ${undo}${resume}`));
 }
@@ -16411,8 +16425,9 @@ function isConcreteIsoInstant(value: string | null): boolean {
 // committed both memory targets and a fresh two-part receipt for this stage
 // attempt. Gate opening deliberately precedes promotion, so the receipt is
 // required only on a forward approval of an unfinished stage. The approval
-// report refuses while this holds, and a step that hands the agent that report
-// (the gate's answer after a scope switch) leaves it out.
+// report refuses while this holds, so a step that hands over the gate's answer
+// after a change made there (openGateAnswerStep) hands over a change request
+// only.
 function practicesApprovalHeld(projectDir: string, slug: string, stateContent: string): boolean {
   return slug === "practices-discovery" &&
     checkboxForSlug(stateContent, slug)?.state !== "completed" &&
