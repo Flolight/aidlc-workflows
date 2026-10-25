@@ -34161,14 +34161,51 @@ export function requestChangesReportArgs(
   ];
 }
 
-// The same report, rendered for this checkout, from the record's own state.
+// The Unit whose step a Request Changes sends back on its own. In a solo walk
+// one Unit at a time, a refusal that names a Unit at a block stage is about
+// that Unit's step: its change goes through the Unit reopen, and every other
+// Unit keeps its finished work. A Unit with its step on this stage still open
+// is not sent back: in progress, the reopen would route the step it is already
+// on, and set aside or paused, it would be picked up where it stopped, so the
+// refusal would come again. It keeps the step's own ways on, as does a refusal
+// that names no Unit. The state names the Unit in progress; the step ledger
+// (unitOpenCheckpoints) also names one set aside or paused.
+function requestChangesUnit(
+  input: Pick<GuardRefusalInput, "stateContent" | "stage" | "unit" | "teamGate" | "projectDir">,
+): string | null {
+  if (!input.unit) return null;
+  const walk = soloUnitMajorRefusal(input);
+  if (walk === null || walk.unit !== input.unit) return null;
+  if (unitStepInProgress(input) !== null) return null;
+  if (input.projectDir !== undefined &&
+    unitOpenCheckpoints(input.projectDir, input.stage).some((open) => open.unit === input.unit)) {
+    return null;
+  }
+  return input.unit;
+}
+
+// The step that sends back one Unit's step as the person's change, with their
+// words: the reopen `next` prints for it pauses any other Unit's open step.
+function unitChangeCommand(stage: string, unit: string): string {
+  return renderEngineInvocation(
+    { route: "orchestrate", args: ["next", "--stage", stage, "--unit", unit, "--change"] },
+    { harnessDir: harnessDir() },
+  );
+}
+
+// The same Request Changes step, rendered for this checkout, from the record's
+// own state.
 export function requestChangesReportCommand(projectDir: string, stage: string, unit: string | undefined): string {
   let teamGate: GuardRefusalInput["teamGate"];
+  let stateContent: string | null = null;
   try {
-    teamGate = unit ? teamUnitGateStatus(projectDir, readStateFile(projectDir), stage, unit) : undefined;
+    stateContent = readStateFile(projectDir);
+    teamGate = unit ? teamUnitGateStatus(projectDir, stateContent, stage, unit) : undefined;
   } catch {
     teamGate = undefined;
   }
+  const own = stateContent === null ? null : requestChangesUnit({ stateContent, stage, unit, teamGate, projectDir });
+  if (own !== null) return unitChangeCommand(stage, own);
   return renderEngineInvocation(
     { route: "orchestrate", args: requestChangesReportArgs(stage, unit, teamGate) },
     { harnessDir: harnessDir() },
@@ -34296,6 +34333,26 @@ function lifecycleResetRemedies(
     return [{ ...restart, action: restart.action + cost("jump") }];
   }
   if (state === "in-progress" || state === "awaiting-approval") {
+    // A change to one Unit's step in a solo walk sends back that step only.
+    const own = requestChangesUnit(input);
+    if (own !== null) {
+      const change =
+        `run \`${unitChangeCommand(input.stage, own)}\` and do what it prints: it sends back "${input.stage}" ` +
+        `for unit "${own}" only, with their words as the change, and every other unit keeps its finished work`;
+      return [
+        {
+          op: "request-changes",
+          action: input.humanAuthority.unattended
+            ? "Halt unattended execution and ask a human what should change. " +
+              `Unset AIDLC_UNATTENDED, ask "What should change?" for stage "${input.stage}" for unit ` +
+              `"${own}", and end the turn. Only after the human answers, ${change}.`
+            : `When the person already said what should change in "${input.stage}" for unit "${own}", ` +
+              `${change}. Otherwise ask "What should change?" and end the turn, then ${change}.`,
+          requiresHuman: true,
+          executableNow: true,
+        },
+      ];
+    }
     const unitContext =
       input.teamGate?.resolved === true && input.unit
         ? ` for Unit "${input.unit}"`
@@ -34451,8 +34508,9 @@ function unaskedQuestionsFile(input: GuardRefusalInput): string | null {
   return toPosix(relative(input.projectDir, path));
 }
 
-// Pure: reads nothing from disk. The same input always yields the same refusal,
-// which is what lets the enforcing tool and the router agree.
+// Given projectDir, it also reads the Unit step ledger (requestChangesUnit). The
+// same input on the same record always yields the same refusal, which is what
+// lets the enforcing tool and the router agree.
 export function evaluateGuardRefusal(
   input: GuardRefusalInput,
 ): GuardRefusal {
@@ -34813,6 +34871,8 @@ export function evaluateGuardRefusal(
     sourceUnbindable: input.attempt.sourceCoverage === "unbindable",
     everyUnit: soloUnitMajorRefusal(input) !== null,
   };
+  // Request Changes about one Unit's step throws away nothing of the others.
+  const unitChange = requestChangesUnit(input) !== null;
   return {
     code: input.code,
     blockedAction: input.blockedAction,
@@ -34823,7 +34883,8 @@ export function evaluateGuardRefusal(
     userMessage: input.userMessage,
     remedies: remedies.map((remedy) => {
       const interaction = remedyInteraction(remedy);
-      const words = interaction === "external-work" ? null : GUARD_REMEDY_WORDING_BY_OP[remedy.op]?.(wording);
+      const context = remedy.op === "request-changes" && unitChange ? { ...wording, everyUnit: false } : wording;
+      const words = interaction === "external-work" ? null : GUARD_REMEDY_WORDING_BY_OP[remedy.op]?.(context);
       return { ...(words ? { op: remedy.op, ...words } : {}), ...remedy, interaction };
     }),
   };
