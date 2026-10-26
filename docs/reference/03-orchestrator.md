@@ -198,7 +198,7 @@ Overrides the test volume strategy (minimal, standard, comprehensive) independen
 
 ### `/aidlc --project-type <type>` -- New Project or Existing Code
 
-The person's word on whether the work is a new project (`greenfield`) or existing code (`brownfield`), which wins over the workspace scan. With no workflow, `next` threads it onto the creation command and the scope-confirm and compose answers, the composer dispatch tells the composer to score the plan with it in place of the scan's type, and the ceremony preview counts Reverse Engineering accordingly. With a workflow running, and before any other branch reads the request (a jump, a single run, compose, a setting), `next` emits a `print` naming `workspace reclassify --project-type <type>` (rescan, `Project Type Source: you`, repos found since creation, Reverse Engineering back on or off the plan, `WORKSPACE_RECLASSIFIED`) bound to the selected work's `--intent` and `--space`, with `--message <id>` for the agent to fill with the id of the person's message that said the type (the print names the ids and times of the messages it can name), so the change records that message as `Message Id` and its words as `Person Reply`. The reclassify reply is a typed directive; the person's lines are kept for the chat and said with the next step the agent speaks from (see [Lines carried to the next spoken step](#lines-carried-to-the-next-spoken-step)). Said on its own, it always rescans and replies with a `done` that continues, so a bare `next` follows; typed with more, the print adds `--then-rerun`, the reply is a `print` naming the same `next` command, and that command runs again and, once the state holds that type as the person's, the rest of the request routes as usual, so nothing typed with it is dropped. On the happy path, `next` then names `aidlc-jump execute --target reverse-engineering --direction redo` when Reverse Engineering is on the plan, not started, behind the cursor, and no Construction stage has started; the redo leaves finished stages alone and the walk returns to the stage the person was on. The jump says so in one line ("Next I'll document the code, then we're back at ..."), kept for the chat as a backward jump's notice is, or in its output's `notice`, which the print tells the agent to say; the reclassify reply leaves it out, because the route is decided only when the jump runs. When the scan set the work up as greenfield and the folder now scans brownfield before Construction, `next` returns a `project-type` ask (outside an open gate) whose two commands, bound to the work asked about, both record the type as the person's.
+The person's word on whether the work is a new project (`greenfield`) or existing code (`brownfield`), which wins over the workspace scan. With no workflow, `next` threads it onto the creation command and the scope-confirm and compose answers, the composer dispatch tells the composer to score the plan with it in place of the scan's type, and the ceremony preview counts Reverse Engineering accordingly. With a workflow running, and before any other branch reads the request (a jump, a single run, compose, a setting), `next` emits a `print` naming `workspace reclassify --project-type <type>` (rescan, `Project Type Source: you`, repos found since creation, Reverse Engineering back on or off the plan, `WORKSPACE_RECLASSIFIED`) bound to the selected work's `--intent` and `--space`, with `--message <id>` for the agent to fill with the id of the person's message that said the type (the print names the ids and times of the messages it can name), so the change records that message as `Message Id` and its words as `Person Reply`. The reclassify reply is a typed directive; the person's lines are kept for the chat and said with the next step the agent speaks from (see [Lines carried to the next spoken step](#lines-carried-to-the-next-spoken-step)). Said on its own, it always rescans and replies with a `done` that continues, so a bare `next` follows; typed with more, the print adds `--then-rerun`, the reply is a `print` naming the same `next` command, and that command runs again and, once the state holds that type as the person's, the rest of the request routes as usual, so nothing typed with it is dropped. On the happy path, `next` then names `aidlc-jump execute --target reverse-engineering --direction redo` when Reverse Engineering is on the plan, not started, behind the cursor, and no Construction stage has started; the redo leaves finished stages alone and the walk returns to the stage the person was on. The jump says so in one line ("Once you approve the code's documentation, we're back at ..."), kept for the chat as a backward jump's notice is, or in its output's `notice`, which the print tells the agent to say; the reclassify reply leaves it out, because the route is decided only when the jump runs. When the scan set the work up as greenfield and the folder now scans brownfield before Construction, `next` returns a `project-type` ask (outside an open gate) whose two commands, bound to the work asked about, both record the type as the person's.
 
 ### Intent creation -- the Initialization phase
 
@@ -491,9 +491,21 @@ for the piece of work is named "the plan you approved" in the creation line and
 "the approved plan" in the first stage's line, which a teammate picking the work
 up also hears, never by the scope it was built on. The engine
 keeps such lines for the chat (`aidlc/.aidlc-sessions/<session>.person-lines`)
-and puts them, in order and once, in front of the `narration` of the next
-directive the agent speaks from: an `ask`, `present-gate`, `parked`, `error`
-or a final `done`, or any other directive that carries its own `narration`.
+and puts them, in order and once, in the `change_notices` of the next
+directive the agent speaks from (ahead of its own): an `ask`, `present-gate`,
+`parked`, `error` or a final `done`, or any other directive that carries its own
+`narration` or `change_notices`. Where the work picks up on `next --resume`
+(`withPickUpLine`) and the framework phase rules put back in a space
+(`withPhaseRulesAddedLine`) ride the same field of the step they come with.
+`change_notices` is the one field for a line the person must hear, and its
+`change_notices_note` the one order: once, as written, in the last message the
+agent writes before the person replies (before the question, when the turn ends with one). That is the message
+every host shows:
+Copilot CLI headless writes one message in most turns and `claude -p` prints
+only the last, so a line said as its step came was lost there. Kiro CLI's
+hand-over of a step it ran itself gives its notices the same order. A line true
+only before the work it describes keeps its own order in the step
+(`plan_note` with plan approval off, `inputs_note`).
 A rules part (`load-steering`) never takes them; its `run-stage` does. They
 belong to the person's current turn: a newer prompt on the work, or fifteen
 minutes with no prompt hook, drops them, so a line never surfaces later or in
@@ -502,9 +514,8 @@ another chat. A line a tool gives inside a stage (`document-input`'s
 it, on a **SAY:** line in the stage file, next to the untrusted-path notice. Without a chat to keep them for, a line
 stays on its own step.
 A line that would push a step over its size limit waits for the next one.
-Every skill says a `print`'s or a `run-stage`'s `narration` first (on a
-`run-stage`, in the same message as the stage's context reads), so the lines
-they carry are heard before the step's own work starts.
+The step's own `narration` stays its own line, said as it comes (on a
+`run-stage`, in the same message as the stage's context reads).
 When the reclassify reply names a finished stage that ran before the code was
 there, the chat counts that stage's out-of-date warning as heard on that work
 (in the same file), and the `stage_validity` advisory with that warning is
