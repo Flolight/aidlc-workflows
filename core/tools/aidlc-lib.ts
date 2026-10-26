@@ -39852,7 +39852,7 @@ export type UnitGateStatus =
   | "revising"
   | "approved";
 
-function gateStagesFromBlock(block: string): string[] {
+export function gateStagesFromBlock(block: string): string[] {
   const explicit = auditBlockField(block, "Gate Stages");
   if (explicit) {
     return explicit
