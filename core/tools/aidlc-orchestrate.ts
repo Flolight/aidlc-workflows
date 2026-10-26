@@ -129,7 +129,7 @@ import {
   takeRestartRequest,
 } from "./aidlc-question-store.ts";
 import {
-  latestMessage, listMessages, noReplySince, personTurnStands, readMessage, standingPersonTurn,
+  latestMessage, listMessages, messageBeforeJoining, noReplySince, personTurnStands, readMessage, standingPersonTurn,
 } from "./aidlc-message-store.ts";
 import { aidlcEntryWords, APPROVAL_GATE_CHOICES, protectedChoices, SUMMARY_CONFIRMATION_CHOICES } from "./aidlc-reply-reader.ts";
 import {
@@ -3878,9 +3878,11 @@ function questionOptions(block: string): string[] {
 // all it needs. `wordsKept`: the person's words go on the answer's row as
 // Person Reply (personsGateReply, personsWordsKept). `alone`: no other question
 // waits on the same reply (openStageQuestion). `stateContent`: whether a yes
-// to building the Units in parallel needs stage by stage first.
+// to building the Units in parallel needs stage by stage first. `message`:
+// their message the plain answer names, when no turn stands for it
+// (messageBeforeJoining).
 function openQuestionAnswer(
-  stage: string, block: string, wordsKept: boolean, alone: boolean, stateContent: string,
+  stage: string, block: string, wordsKept: boolean, alone: boolean, stateContent: string, message?: string,
 ): string {
   const checkpoint = auditBlockField(block, "Checkpoint");
   const unit = auditBlockField(block, "Unit");
@@ -3958,7 +3960,7 @@ function openQuestionAnswer(
         `${policy ? ", with `<id>` the message they answered in," : ""} and ` +
         `${setters.length > 1 ? "say their notice lines" : "say its notice line"}`
       : `${reading ? `${numberedChoices(options)}record the choice they made, as you read it from their reply, with` : "record it with"} ` +
-        `\`${aidlcToolInvocation("log")} answer --stage ${shellArg(stage)} ` +
+        `\`${aidlcToolInvocation("log")} answer --stage ${shellArg(stage)}${message ? ` --message ${message}` : ""} ` +
         `--details '${reading ? "<their choice>" : "<their exact reply>"}'\` ` +
         "(with the checkpoint flags that question was logged with, when it has them)";
 }
@@ -3969,15 +3971,18 @@ function openQuestionAnswer(
 // was asked, with its choices, which a chat that never saw it asked needs, and
 // a command for each: the question's own answer command, or `next --request`
 // with the person's words, kept as `requestId`, which asks where that work
-// belongs.
+// belongs. `before`: the id of their message from before this chat joined the
+// work (messageBeforeJoining), named on the answer; its proof takes only a
+// message that carries their words, which `log answer` keeps beside it.
 function openQuestionReplyDirective(
   { stage, block, alone }: { stage: string; block: string; alone: boolean },
   requestId: string,
   { replies, wordsKept }: ReturnType<typeof chatReplies>,
   stateContent: string,
+  before: string | null = null,
 ): PrintDirective {
   const orchestrate = aidlcToolInvocation("orchestrate");
-  const answer = openQuestionAnswer(stage, block, wordsKept, alone, stateContent);
+  const answer = openQuestionAnswer(stage, block, wordsKept || before !== null, alone, stateContent, before ?? undefined);
   const decision = auditBlockField(block, "Decision");
   const choices = questionOptions(block);
   const asked = decision
@@ -11987,7 +11992,11 @@ function routeNext(agentArgs: string[], projectDir: string | undefined): void {
         pd, flags.intent, "", "routing", { space: selection.space, targets: routingTargets() }, false, undefined,
         undefined, routingSettings(carriedRoutingFlags(flags)),
       );
-      emit(openQuestionReplyDirective(open, words.id, chatReplies(pd, open.stage), stateContent));
+      // With no reply of theirs on record here, the words may be from before
+      // this chat joined the work (a teammate's clone): the answer names them.
+      const replies = chatReplies(pd, open.stage);
+      const before = replies.replies.length === 0 ? messageBeforeJoining(pd, words.messageId) : null;
+      emit(openQuestionReplyDirective(open, words.id, replies, stateContent, before));
       return;
     }
     // Words at the engine's recovery question, once it holds the person's
