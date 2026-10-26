@@ -45998,12 +45998,18 @@ export function engineErrorRelayText(message: string): string {
   return `${ENGINE_ERROR_RELAY_LABEL}\n> ${message}`;
 }
 
-/** The relay line for `harness`, or null where no channel would show it. */
+/**
+ * The relay line for `harness`, or null where no channel would show it. On
+ * opencode it carries no note: the plugin hands a line's note to the model, and
+ * the toast is gone in seconds (and never drawn headless), so the opencode skill
+ * prints the error itself and must not read that the person was shown it.
+ */
 export function engineErrorRelayLine(
   message: string,
   harness: string = runtimeHarnessName(),
 ): string | null {
   if (!ENGINE_ERROR_RELAY_HARNESSES.has(harness)) return null;
+  if (harness === "opencode") return `${JSON.stringify({ systemMessage: engineErrorRelayText(message) })}\n`;
   return `${JSON.stringify({
     systemMessage: engineErrorRelayText(message),
     hookSpecificOutput: {
@@ -46011,6 +46017,114 @@ export function engineErrorRelayLine(
       additionalContext: ENGINE_ERROR_RELAY_NOTE,
     },
   })}\n`;
+}
+
+/**
+ * Harnesses whose Bash PostToolUse hook hands the model a note the person does
+ * not see: Claude Code reads `additionalContext` as hook context and Codex as a
+ * developer message, and neither draws it; the opencode plugin puts it in the
+ * tool result the model reads, while its panel draws the command's own output
+ * (`metadata.output`). Measured with a probe hook on Claude Code 2.1.310, Codex
+ * 0.164.0 and opencode 1.19.4. Kiro CLI keeps the order in the setter's own
+ * output by decision, as Copilot, Cursor and Kiro IDE do.
+ */
+export const SAY_ONCE_NOTE_HARNESSES: ReadonlySet<string> = new Set(["claude", "codex", "opencode"]);
+
+/** What the setter leaves for the chat's next shell call: the order with its lines, and the chat's newest messages then. */
+export interface SayOnceNote {
+  say: string;
+  newest: ChatNewest;
+}
+
+/** A chat's newest messages: when the latest was sent, and every message sent then. */
+interface ChatNewest {
+  at: string;
+  ids: string[];
+}
+
+function chatNewest(projectDir: string, sessionId: string | null): ChatNewest | null {
+  const { listMessages } = require("./aidlc-message-store.ts") as typeof import("./aidlc-message-store.ts");
+  const chats = listMessages(projectDir).filter((message) => message.session === sessionId);
+  if (chats.length === 0) return null;
+  const at = chats[chats.length - 1].at;
+  return { at, ids: chats.filter((message) => message.at === at).map((message) => message.id) };
+}
+
+function sayOnceNotePath(projectDir: string, sessionId: string | null): string {
+  const recordPath = sessionId === null ? "" : sessionRecordPath(projectDir, sessionId);
+  return recordPath ? `${recordPath}.say-once` : "";
+}
+
+/**
+ * Leave `say` for this chat's next shell call hook, where the harness hands the
+ * model a note; true when it is left, and the setter then prints its lines
+ * alone. It stands on the chat's newest messages now, whichever message the
+ * setting stood on, which may be an earlier one. False on any doubt, and the
+ * order stays in the output.
+ */
+export function leaveSayOnceNote(
+  projectDir: string,
+  sessionId: string | null,
+  say: string,
+  harness: string = runtimeHarnessName(),
+): boolean {
+  if (!SAY_ONCE_NOTE_HARNESSES.has(harness)) return false;
+  const path = sayOnceNotePath(projectDir, sessionId);
+  if (!path) return false;
+  try {
+    const newest = chatNewest(projectDir, sessionId);
+    if (newest === null) return false;
+    mkdirSync(sessionsDir(projectDir), { recursive: true });
+    const note: SayOnceNote = { say, newest };
+    writeFileAtomic(path, `${JSON.stringify(note)}\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The PostToolUse line that hands this chat's note to the model, taken once by
+ * the chat's next shell call (the setter's own, as a rule; the note carries the
+ * lines, so another call that ends first hands over the same words), or null.
+ * A note the chat has a newer message than is dropped: the person has written
+ * again since, and the line is never said late.
+ */
+export function sayOnceNoteLine(
+  projectDir: string,
+  sessionId: string | undefined,
+  harness: string = runtimeHarnessName(),
+): string | null {
+  if (!SAY_ONCE_NOTE_HARNESSES.has(harness)) return null;
+  const valid = validSessionId(sessionId);
+  // The setter's chat: a Codex helper thread's id maps to its root, as resolveChat maps it.
+  const chat = valid === null ? null : helperSessionRoot(projectDir, valid) ?? valid;
+  const path = sayOnceNotePath(projectDir, chat);
+  if (!path || !existsSync(path)) return null;
+  // Taken by a rename, so two deliveries of one call cannot both hand it over.
+  const taken = `${path}.${process.pid}`;
+  try {
+    renameSync(path, taken);
+  } catch {
+    return null;
+  }
+  let note: Partial<SayOnceNote> | null = null;
+  try {
+    note = JSON.parse(readFileSync(taken, "utf-8")) as Partial<SayOnceNote>;
+  } catch {
+    /* unreadable: dropped */
+  }
+  try {
+    unlinkSync(taken);
+  } catch {
+    /* per-user runtime state; best-effort */
+  }
+  if (typeof note?.say !== "string" || note.say === "") return null;
+  const then = note.newest;
+  const now = chatNewest(projectDir, chat);
+  if (now === null || typeof then?.at !== "string" || !Array.isArray(then.ids)) return null;
+  if (now.at !== then.at || now.ids.some((id) => !then.ids.includes(id))) return null;
+  return `${JSON.stringify({ hookSpecificOutput: { hookEventName: "PostToolUse", additionalContext: note.say } })}\n`;
 }
 
 /**
@@ -46027,10 +46141,12 @@ export function hookContextLine(event: "SessionStart" | "UserPromptSubmit", cont
   })}\n`;
 }
 
-/** Hand an engine `error` directive's exact message to the human where possible. */
-export function writeEngineErrorRelay(message: string): void {
+/** Hand an engine `error` directive's exact message to the human where possible; true when a line was written. */
+export function writeEngineErrorRelay(message: string): boolean {
   const line = engineErrorRelayLine(message);
-  if (line !== null) process.stdout.write(line);
+  if (line === null) return false;
+  process.stdout.write(line);
+  return true;
 }
 
 /**
