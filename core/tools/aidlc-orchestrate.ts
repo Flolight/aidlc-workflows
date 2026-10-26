@@ -3188,12 +3188,16 @@ function scopeCommands(
   carried: string,
   projectDir: string,
   declaredType?: "greenfield" | "brownfield",
+  // The stage changes typed with the request: each plan carries those it can
+  // take (typedStageAnswers), and its count includes them.
+  stages?: StageAnswers,
 ): ScopeCommandRow[] {
   return [...validScopes()].map((scope) => {
-    const cost = effectiveScopeCostSummary(scope, projectDir, undefined, declaredType);
+    const changes = stages?.typed ? changesThatApply(scope, stages.typed) : undefined;
+    const cost = effectiveScopeCostSummary(scope, projectDir, changes, declaredType);
     return {
       scope,
-      command: `${prefix} --scope ${scopeArg(scope)} --request ${questionId}${carried}`,
+      command: `${prefix} --scope ${scopeArg(scope)} --request ${questionId}${carried}${planStageFlags(changes, stages?.planName)}`,
       ...(cost ? { stages: `${cost.shown} ${cost.shown === 1 ? "stage" : "stages"}` } : {}),
     };
   });
@@ -3448,12 +3452,14 @@ function scopeConfirmAskDirective(
   // The settings typed with the request, for an answer that arrives without
   // its option's command (the proposal step's question keeps the same).
   settings?: QuestionSettings,
+  // The stage changes typed with the request (typedStageAnswers).
+  stages: StageAnswers = { plan: "", tailored: "" },
 ): AskDirective {
   const tool = aidlcToolInvocation("orchestrate");
   const stored = saveQuestion(projectDir, intentText, proposedScope, "front", undefined, newWork, derivedFrom, undefined, settings);
-  const confirmCommand = `${tool} next --scope ${scopeArg(proposedScope)} --request ${stored.id}${carried}`;
-  const composeCommand = `${tool} next compose --request ${stored.id}${carried}`;
-  const scopes = scopeCommands(`${tool} next`, stored.id, carried, projectDir, declaredType);
+  const confirmCommand = `${tool} next --scope ${scopeArg(proposedScope)} --request ${stored.id}${carried}${stages.plan}`;
+  const composeCommand = `${tool} next compose --request ${stored.id}${carried}${stages.tailored}`;
+  const scopes = scopeCommands(`${tool} next`, stored.id, carried, projectDir, declaredType, stages);
   return {
     kind: "ask",
     ask_type: "scope-confirm",
@@ -3539,6 +3545,8 @@ function composeOfferAskDirective(
   // As above: the request an earlier question held these words for.
   derivedFrom?: string,
   settings?: QuestionSettings,
+  // The stage changes typed with the request (typedStageAnswers).
+  stages: StageAnswers = { plan: "", tailored: "" },
 ): AskDirective {
   const tool = aidlcToolInvocation("orchestrate");
   const stored = saveQuestion(projectDir, intentText, "", "front", undefined, newWork, derivedFrom, undefined, settings);
@@ -3549,8 +3557,8 @@ function composeOfferAskDirective(
     response_route: "next",
     question,
     ...(document === null ? {} : { document_note: document }),
-    compose_command: `${tool} next compose --request ${stored.id}${carried}`,
-    scope_commands: scopeCommands(`${tool} next`, stored.id, carried, projectDir, declaredType),
+    compose_command: `${tool} next compose --request ${stored.id}${carried}${stages.tailored}`,
+    scope_commands: scopeCommands(`${tool} next`, stored.id, carried, projectDir, declaredType, stages),
   };
 }
 
@@ -6327,6 +6335,50 @@ const NEW_WORK_HINT =
   "the human's yes run `next --new-intent --scope <scope> \"<text>\"` (see the " +
   "SKILL's new-work offer, never auto-create).";
 
+// The typed stage changes `plan` can take, each checked on its own; undefined
+// when none applies, or when together they do not apply.
+function changesThatApply(plan: string, typed: PlanChanges): PlanChanges | undefined {
+  const fits = (changes: PlanChanges): boolean => planWithChanges(plan, changes).errors.length === 0;
+  const applying: PlanChanges = {
+    skip: typed.skip.filter((slug) => fits({ skip: [slug], add: [] })),
+    add: typed.add.filter((slug) => fits({ skip: [], add: [slug] })),
+  };
+  return applying.skip.length + applying.add.length > 0 && fits(applying) ? applying : undefined;
+}
+
+interface StageAnswers {
+  /** The proposed plan's answers: the changes it can take, as flags. */
+  plan: string;
+  /** Those changes, which the question's count includes. */
+  changes?: PlanChanges;
+  /** The tailored plan's answer: every change, for its composer. */
+  tailored: string;
+  /** What was typed, for each listed plan's row (`scopeCommands`). */
+  typed?: PlanChanges;
+  planName?: string;
+}
+
+// The stage changes typed with a request (`--skip`/`--add`) on its plan
+// question's answers. They are the person's own: the tailored plan's composer
+// is told them all, and the proposed plan takes those it can (one it already
+// makes would only be refused at creation, so it is left off).
+function typedStageAnswers(plan: string, typed: PlanChanges | undefined, planName?: string): StageAnswers {
+  if (typed === undefined) return { plan: "", tailored: "" };
+  const changes = validScopes().has(plan) ? changesThatApply(plan, typed) : undefined;
+  return {
+    plan: planStageFlags(changes, planName),
+    ...(changes ? { changes } : {}),
+    tailored: carriedRoutingFlags({ planChanges: typed, planName }).planChanges,
+    typed,
+    ...(planName ? { planName } : {}),
+  };
+}
+
+// The `--skip`/`--add` flags (and the plan's name) a plan's answer carries.
+function planStageFlags(changes: PlanChanges | undefined, planName?: string): string {
+  return changes ? carriedRoutingFlags({ planChanges: changes, planName }).planChanges : "";
+}
+
 // The plan offer for new work that names no scope: a keyword hit proposes that
 // scope with its ceremony; anything else gets the compose offer. Shared by a
 // fresh workspace (Branch 8) and an explicit request for new work that named
@@ -6348,11 +6400,12 @@ function freshWorkOfferDirective(
   const kept = derivedFrom === undefined ? null : readQuestion(pd, derivedFrom);
   const root = kept === null ? null : kept.origin === "routing" ? kept : kept.composedFrom ? readQuestion(pd, kept.composedFrom) : null;
   const settings = root?.origin === "routing" ? routingSettings(carriedRoutingFlags(flags)) : undefined;
+  const stages = typedStageAnswers(plan, flags.planChanges, flags.planName);
   if (plan !== "compose") {
     // Preview the ceremony the user is confirming: stage/gate counts from the
     // compiled grid (never estimates). Drop the clause if the scope does not
     // resolve (a fixture tree without it) rather than emit a broken preview.
-    const clause = costClause(plan, pd, undefined, flags.projectType);
+    const clause = costClause(plan, pd, stages.changes, flags.projectType);
     const cost = clause ? ` - ${clause}` : "";
     return scopeConfirmAskDirective(
       `I'd run the "${plan}" plan for: "${requestPreview(intentText)}"${cost}.${documentSplitSentence(intentText)} ` +
@@ -6365,16 +6418,20 @@ function freshWorkOfferDirective(
       flags.projectType,
       derivedFrom,
       settings,
+      stages,
     );
   }
   // Anchor the compose offer with the counts for the named scopes so the
   // user calibrates the order-of-magnitude difference before deciding, and
   // sees bugfix even when the description gave no word to match. Fall back
   // to bare names if any scope does not resolve.
-  const bugfix = effectiveScopeCostSummary("bugfix", pd, undefined, flags.projectType);
-  const express = effectiveScopeCostSummary("express", pd, undefined, flags.projectType);
-  const classic = effectiveScopeCostSummary("classic", pd, undefined, flags.projectType);
-  const feat = effectiveScopeCostSummary("feature", pd, undefined, flags.projectType);
+  // Each counted with the typed stage changes it can take, as its row is.
+  const anchor = (scope: string) =>
+    effectiveScopeCostSummary(scope, pd, stages.typed ? changesThatApply(scope, stages.typed) : undefined, flags.projectType);
+  const bugfix = anchor("bugfix");
+  const express = anchor("express");
+  const classic = anchor("classic");
+  const feat = anchor("feature");
   const fallbackExamples = [...validScopes()].slice(0, 3).join(", ") || "an explicit scope";
   const examples = bugfix && express && classic && feat
     ? `bugfix = ${bugfix.shown} stages, express = ${express.shown}, classic = ${classic.shown}, feature = ${feat.shown}`
@@ -6390,6 +6447,7 @@ function freshWorkOfferDirective(
     flags.projectType,
     derivedFrom,
     settings,
+    stages,
   );
 }
 
@@ -6625,10 +6683,12 @@ function createPrintDirective(
       ` Replace \`--label\` with a 2-3 word kebab essence of the requested work (e.g. "simple calc"), which becomes the readable folder name for this piece of work.`;
   }
   // The stage changes of a plan composed for this request are the ones the
-  // composer validated and the gate showed, so a list retyped by hand on
-  // Approve never drops or adds a stage. A creation with no list is the
-  // person's own pick of the plain scope (after a Reject), and keeps it, unless
-  // the approved plan is that plain scope (a matched plan). The plan created as
+  // composer validated and the gate showed. A list typed that is not theirs
+  // creates nothing yet (composedPlanChangeStep): one retyped by hand on
+  // Approve, a change asked for at the gate, or the plan question's own list
+  // after a Reject. A creation with no list is the person's own pick of the
+  // plain scope (after a Reject), and keeps it, unless the approved plan is that
+  // plain scope (a matched plan). The plan created as
   // approved keeps the project type the composer planned for on the person's
   // word (approvedComposerPlan) when they typed none and the scan reads the
   // folder otherwise, so creation counts and runs the stages the gate showed.
@@ -7094,6 +7154,20 @@ function composeDispatchDirective(
     if (flags.projectType) {
       parts.push(
         `The person said this is ${flags.projectType === "brownfield" ? "existing code" : "a new project"}: the composer plans it as ${flags.projectType}, passing \`--project-type ${flags.projectType}\` to \`graph ars\` and \`graph validate-grid\` in place of the scan's projectType.`,
+      );
+    }
+    // Stages the person asked to skip or add with the request are their own
+    // change: the plan the composer proposes keeps them.
+    const asked = flags.planChanges;
+    if (asked && asked.skip.length + asked.add.length > 0) {
+      const named = [
+        ...(asked.skip.length > 0 ? [`skip ${asked.skip.join(", ")}`] : []),
+        ...(asked.add.length > 0 ? [`add ${asked.add.join(", ")}`] : []),
+      ].join(" and ");
+      parts.push(
+        `With this request the person asked to ${named}: that is their own change, so the plan the composer proposes ` +
+          "keeps it in its grid and in changes.skip and changes.add, never folded into a stock grid (a stock grid it " +
+          "changes is a custom plan on that base, as an edit at the gate makes it), until they change it at the gate.",
       );
     }
     if (flags.report) {
@@ -10064,6 +10138,13 @@ function routeNext(agentArgs: string[], projectDir: string | undefined): void {
   if (openFront !== null) {
     const tool = `${aidlcToolInvocation("orchestrate")} next`;
     const open = openFront.question;
+    // The commands named here carry the stage changes typed with the request,
+    // as the question's own do, from the request's stored copy.
+    const root = open.settings ? open : open.composedFrom ? readQuestion(questionDir, open.composedFrom) : null;
+    const kept = root?.settings ? parseNextFlags(root.settings.newWork) : null;
+    const stages = kept && !kept.parseError
+      ? typedStageAnswers(open.proposedScope, kept.planChanges, kept.planName)
+      : typedStageAnswers(open.proposedScope, undefined);
     const answer = !openFront.sole
       // More than one plan question is open on this work, so which one they are
       // answering is the agent's to know: it ran the one it showed them, and
@@ -10071,9 +10152,9 @@ function routeNext(agentArgs: string[], projectDir: string | undefined): void {
       ? "the command that question gave for their choice, as that question still stands in your own chat, " +
         "with the `--request` id it came with"
       : open.proposedScope.length > 0
-        ? `\`${tool} --scope ${scopeArg(open.proposedScope)} --request ${open.id}\`, ` +
-          `or \`${tool} compose --request ${open.id}\` for a plan tailored to it`
-        : `\`${tool} compose --request ${open.id}\`, or one of the plan commands that question listed, ` +
+        ? `\`${tool} --scope ${scopeArg(open.proposedScope)} --request ${open.id}${stages.plan}\`, ` +
+          `or \`${tool} compose --request ${open.id}${stages.tailored}\` for a plan tailored to it`
+        : `\`${tool} compose --request ${open.id}${stages.tailored}\`, or one of the plan commands that question listed, ` +
           `each with \`--request ${open.id}\``;
     emit(printDirective(
       "The person has not answered the plan question they were asked, so `next` cannot tell their reply from a " +
@@ -10267,9 +10348,11 @@ function routeNext(agentArgs: string[], projectDir: string | undefined): void {
     ));
     return;
   }
+  // The plan offer's compose answer carries the stage changes typed with its
+  // request too, which the composer is told; every other compose takes none.
   if (
     flags.planChanges &&
-    (flags.readOnly || flags.config || flags.workspaceCommand || flags.compose ||
+    (flags.readOnly || flags.config || flags.workspaceCommand || (flags.compose && !offerCompose) ||
       flags.newScope || flags.report || flags.single || flags.stage || flags.phase || flags.resume)
   ) {
     emit(errorDirective(
