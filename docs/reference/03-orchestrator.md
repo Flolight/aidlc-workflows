@@ -521,6 +521,20 @@ there, the chat counts that stage's out-of-date warning as heard on that work
 (in the same file), and the `stage_validity` advisory with that warning is
 left off its later steps.
 
+One such line comes from the creation itself. While a chat's plan question for
+new work is open, the Plan-Approval guard keeps each file the agent writes there
+with what it held just before
+([Plan-Approval Guard Hook](06-hooks-and-tools.md#plan-approval-guard-hook)).
+When the person's pick creates the work, `intent create` names the kept files
+that still differ, once, with the way back worked out against git at that
+moment: "Before this work started, src/app.js was changed;
+`git checkout HEAD -- src/app.js` puts it back as last committed." A file that held
+the person's uncommitted edits, or one outside git, is said to be beyond
+undoing; a new file is to be deleted. The person's own edits, a teammate's pull and generated files
+reach no hook and are never named. The work keeps what those files held before
+(`.aidlc-engine/before-pick.json`), so a file the person puts back reads as
+nobody's change when Code Generation accounts for its Units.
+
 ### Inline Execution
 
 Inline stages run directly in the orchestrator conversation. The user can interact with the stage in real time. Twenty-nine of 33 stages are inline; the other four are dispatched (practices-discovery and code-generation subagents, reverse-engineering pipeline, user-stories mob).
