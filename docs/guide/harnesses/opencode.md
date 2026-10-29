@@ -252,7 +252,9 @@ Degradations compared with opencode 1:
   todo-driven statusline mirror is missing. Use `/aidlc --status`.
 - **`/aidlc` shows its template.** OpenCode 2 has no `command.execute.before`
   hook, so your chat shows the command's template rather than the line you
-  typed, and the human-turn hook reads the submitted prompt text.
+  typed. The adapter reads the line you typed back out of the template, so a
+  switch such as `/aidlc --review none` is kept and a bare `/aidlc` counts as a
+  command, as on opencode 1.
 - **No engine-error toast.** OpenCode 2 gives plugins no TUI toast channel; the
   conductor skill still prints the engine's error message verbatim.
 - **Default shell dialect.** OpenCode 2 does not expose the `shell` setting to

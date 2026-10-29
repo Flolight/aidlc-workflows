@@ -181,6 +181,34 @@ describe("t241b OpenCode 2 entry point", () => {
     expect(turns[0]).toMatchObject({ hook_event_name: "UserPromptSubmit", session_id: "ses_main", prompt: "approve" });
   });
 
+  // OpenCode 2 has no command.execute.before: the prompt hook gets the /aidlc
+  // template expanded, with what the person typed after /aidlc in place of
+  // $ARGUMENTS and the skill text in place of the shell line (seen live on
+  // 2.2.1). The turn is recorded as the line they typed, as on opencode 1, so a
+  // typed switch is kept and a bare /aidlc is a command, never a reply.
+  test("an /aidlc line is recorded as the person typed it, not as its template", async () => {
+    const root = freshProject();
+    const capture = join(root, "human-turn.jsonl");
+    writeHook(root, "aidlc-session-start.ts", "await Bun.stdin.text();\n");
+    recordingHook(root, "aidlc-record-human-turn.ts", capture);
+    const template = readFileSync(join(REPO_ROOT, "harness", "opencode", "command", "aidlc.md"), "utf-8")
+      .replaceAll("{{INVOKE}}", "bun .aidlc/tools/aidlc.ts");
+    mkdirSync(join(root, ".opencode", "command"), { recursive: true });
+    writeFileSync(join(root, ".opencode", "command", "aidlc.md"), template, "utf-8");
+    const body = template.slice(template.indexOf("\n---\n", 4) + "\n---\n".length);
+    const expanded = (args: string) =>
+      body.replace("$ARGUMENTS", args).replace(/!`[^`\n]*`/, "---\nname: aidlc\ndescription: AI-DLC\n---\n\n# AI-DLC");
+    const v2 = await setup(root);
+    await v2.prompt("ses_main", expanded("--review none"));
+    await v2.prompt("ses_main", expanded(""));
+    await v2.prompt("ses_main", "Follow the steps in the README");
+    expect(captured(capture).map((turn) => turn.prompt)).toEqual([
+      "/aidlc --review none",
+      "/aidlc",
+      "Follow the steps in the README",
+    ]);
+  });
+
   test("a subagent's prompt is never recorded as a human turn", async () => {
     const root = freshProject();
     const capture = join(root, "human-turn.jsonl");

@@ -57,6 +57,7 @@
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 // emit.ts points this at the projected .aidlc/tools/ copy.
 import { windowsScriptLaunch } from "../../../core/tools/aidlc-executable-path.ts";
@@ -1191,7 +1192,8 @@ async function createV1Adapter({
 //   - V2 has no todo tool, so aidlc-sync-workflow-state.ts (todowrite) never
 //     runs; workflow state is still advanced by the engine's own commands.
 //   - V2 has no command.execute.before: the person's chat shows the /aidlc
-//     template, and the human-turn hook reads the submitted prompt text.
+//     template. The prompt hook gets it expanded, so typedAidlcArguments
+//     reads what they typed back out of it and the turn records that line.
 //   - There is no TUI toast channel; the conductor skill still prints the
 //     engine-error relay message verbatim.
 //   - The shell setting is not exposed, so the bash boundary reads commands
@@ -1246,6 +1248,28 @@ function v2ToolOutput(result: unknown): string {
 
 type V1Hooks = Awaited<ReturnType<typeof createV1Adapter>>;
 
+// What the person typed after /aidlc, read back from the expanded template
+// OpenCode 2 hands the prompt hook: the installed command file's text before
+// $ARGUMENTS, then their words, then the skill text its shell line prints. Null
+// for any other prompt, or when the command file cannot be read.
+function typedAidlcArguments(text: string, directory: string): string | null {
+  let file: string;
+  try {
+    file = readFileSync(join(directory, ".opencode", "command", "aidlc.md"), "utf-8").replace(/\r\n/g, "\n");
+  } catch {
+    return null;
+  }
+  const frontmatterEnd = file.startsWith("---\n") ? file.indexOf("\n---\n", 4) : -1;
+  const body = frontmatterEnd < 0 ? file : file.slice(frontmatterEnd + "\n---\n".length);
+  const at = body.indexOf("$ARGUMENTS");
+  const prompt = text.replace(/\r\n/g, "\n");
+  if (at <= 0 || !prompt.startsWith(body.slice(0, at))) return null;
+  const rest = prompt.slice(at);
+  const skill = rest.indexOf("\n\n---\nname: aidlc\n");
+  const end = skill >= 0 ? skill : rest.indexOf("\n\n");
+  return end < 0 ? rest : rest.slice(0, end);
+}
+
 /**
  * Wire the V1 hook map onto an OpenCode 2 context. Returns the cleanup that
  * stops the event subscription. Reached through the default export's setup().
@@ -1296,10 +1320,13 @@ async function setupV2(
     sessionID: string;
     prompt: { text?: string };
   }) => {
-    await hooks["chat.message"](
-      { sessionID: event.sessionID },
-      { parts: [{ type: "text", text: event.prompt?.text ?? "" }] },
-    );
+    const text = event.prompt?.text ?? "";
+    const parts: ChatPart[] = [{ type: "text", text }];
+    const args = typedAidlcArguments(text, ctx.location.directory);
+    if (args !== null) {
+      await hooks["command.execute.before"]({ command: "aidlc", sessionID: event.sessionID, arguments: args }, { parts });
+    }
+    await hooks["chat.message"]({ sessionID: event.sessionID }, { parts });
   });
 
   await ctx.tool.hook("execute.before", async (event: {
